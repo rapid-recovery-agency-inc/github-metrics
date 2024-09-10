@@ -9,6 +9,11 @@ import fs from "fs";
 // Load environment variables
 dotenv.config();
 
+interface RankedUser {
+  user: string;
+  totalIndex: number;
+}
+
 // Initialize Octokit instance with GitHub token
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN,
@@ -33,12 +38,15 @@ const cachedData: Record<number, any> = {};
 // Helper function to handle rate limits and retry after the reset time
 async function handleRateLimit(response: any) {
   if (response.headers["x-ratelimit-remaining"] === "0") {
-    const resetTimestamp = parseInt(response.headers["x-ratelimit-reset"], 10) * 1000; // Convert to milliseconds
+    const resetTimestamp =
+      parseInt(response.headers["x-ratelimit-reset"], 10) * 1000; // Convert to milliseconds
     const resetTime = new Date(resetTimestamp);
     const currentTime = new Date();
 
     const waitTime = resetTime.getTime() - currentTime.getTime();
-    console.log(`\n Rate limit exceeded. Waiting for ${waitTime / 1000} seconds...`);
+    console.log(
+      `\n Rate limit exceeded. Waiting for ${waitTime / 1000} seconds...`
+    );
 
     // Wait until the rate limit resets
     await new Promise((resolve) => setTimeout(resolve, waitTime));
@@ -46,7 +54,11 @@ async function handleRateLimit(response: any) {
 }
 
 // Helper function to break down date range into intervals to avoid hitting the 1000 search limit
-function getDateIntervals(startDate: Date, endDate: Date, intervalInDays: number) {
+function getDateIntervals(
+  startDate: Date,
+  endDate: Date,
+  intervalInDays: number
+) {
   const intervals: { since: string; until: string }[] = [];
   let currentStartDate = new Date(startDate);
 
@@ -56,7 +68,10 @@ function getDateIntervals(startDate: Date, endDate: Date, intervalInDays: number
 
     intervals.push({
       since: currentStartDate.toISOString(),
-      until: (currentEndDate > endDate ? endDate : currentEndDate).toISOString(),
+      until: (currentEndDate > endDate
+        ? endDate
+        : currentEndDate
+      ).toISOString(),
     });
 
     currentStartDate = new Date(currentEndDate);
@@ -66,7 +81,11 @@ function getDateIntervals(startDate: Date, endDate: Date, intervalInDays: number
 }
 
 // Function to fetch all commits within a given date range using date intervals
-async function fetchCommitsInDateRange(repoOwner: string, startDate: Date, endDate: Date) {
+async function fetchCommitsInDateRange(
+  repoOwner: string,
+  startDate: Date,
+  endDate: Date
+) {
   const allCommits = [];
   const dateIntervals = getDateIntervals(startDate, endDate, 5); // 5-day interval to avoid the 1000 result limit
 
@@ -90,7 +109,6 @@ async function fetchCommitsInDateRange(repoOwner: string, startDate: Date, endDa
         // Check if there are more pages
         hasMore = response.data.items.length === 100;
         page += 1;
-
       } catch (error: any) {
         if (error.status === 403) {
           console.log("\n Rate limit error detected. Retrying after reset...");
@@ -106,7 +124,11 @@ async function fetchCommitsInDateRange(repoOwner: string, startDate: Date, endDa
 }
 
 // Function to fetch all pull requests within a given date range using date intervals
-async function fetchPullRequestsInDateRange(repoOwner: string, startDate: Date, endDate: Date) {
+async function fetchPullRequestsInDateRange(
+  repoOwner: string,
+  startDate: Date,
+  endDate: Date
+) {
   const allPullRequests = [];
   const dateIntervals = getDateIntervals(startDate, endDate, 5); // 5-day interval to avoid the 1000 result limit
 
@@ -117,7 +139,7 @@ async function fetchPullRequestsInDateRange(repoOwner: string, startDate: Date, 
     while (hasMore) {
       try {
         const response = await octokit.search.issuesAndPullRequests({
-          q: `org:${repoOwner} type:pr created:${since}..${until}`,
+          q: `org:${repoOwner} type:pr is:merged created:${since}..${until}`,
           per_page: 100,
           page,
         });
@@ -130,7 +152,6 @@ async function fetchPullRequestsInDateRange(repoOwner: string, startDate: Date, 
         // Check if there are more pages
         hasMore = response.data.items.length === 100;
         page += 1;
-
       } catch (error: any) {
         if (error.status === 403) {
           console.log("\n Rate limit error detected. Retrying after reset...");
@@ -146,7 +167,11 @@ async function fetchPullRequestsInDateRange(repoOwner: string, startDate: Date, 
 }
 
 // Function to fetch reviews for a specific pull request
-async function fetchReviewsForPR(repoOwner: string, repoName: string, prNumber: number) {
+async function fetchReviewsForPR(
+  repoOwner: string,
+  repoName: string,
+  prNumber: number
+) {
   const allReviews = [];
   let page = 1;
   let hasMore = true;
@@ -169,7 +194,6 @@ async function fetchReviewsForPR(repoOwner: string, repoName: string, prNumber: 
       // Check if there are more pages
       hasMore = response.data.length === 100;
       page += 1;
-
     } catch (error: any) {
       if (error.status === 403) {
         console.log("\n Rate limit error detected. Retrying after reset...");
@@ -184,11 +208,19 @@ async function fetchReviewsForPR(repoOwner: string, repoName: string, prNumber: 
 }
 
 // Function to aggregate metrics for a specific date range
-async function aggregateMetricsByDateRange(repoOwner: string, startDate: Date, endDate: Date) {
+async function aggregateMetricsByDateRange(
+  repoOwner: string,
+  startDate: Date,
+  endDate: Date
+) {
   const userMetrics: any = {};
 
   const commits = await fetchCommitsInDateRange(repoOwner, startDate, endDate);
-  const pullRequests = await fetchPullRequestsInDateRange(repoOwner, startDate, endDate);
+  const pullRequests = await fetchPullRequestsInDateRange(
+    repoOwner,
+    startDate,
+    endDate
+  );
 
   // Aggregate commit metrics by user
   commits.forEach((commit) => {
@@ -205,7 +237,7 @@ async function aggregateMetricsByDateRange(repoOwner: string, startDate: Date, e
   // Aggregate pull request metrics by user
   for (const pr of pullRequests) {
     const author = pr.user?.login || "Unknown";
-    const repoName = `${pr.repository_url.split('/').pop()}`;
+    const repoName = `${pr.repository_url.split("/").pop()}`;
 
     userMetrics[author] = userMetrics[author] || {
       commits: 0,
@@ -246,9 +278,13 @@ async function aggregateMetricsByDateRange(repoOwner: string, startDate: Date, e
 }
 
 // Function to generate reports for multiple time periods
-async function generateReportForTimePeriods(repoOwner: string, periods: Record<number, string>) {
+async function generateReportForTimePeriods(
+  repoOwner: string,
+  periods: Record<number, string>
+) {
   const workbook = xlsx.utils.book_new();
   const endDate = new Date();
+  let rankedUsers: RankedUser[] = [];
 
   // Initialize progress bar
   bar.start(Object.keys(periods).length, 0);
@@ -261,7 +297,9 @@ async function generateReportForTimePeriods(repoOwner: string, periods: Record<n
 
     // Determine which cached data to use
     let cachedPeriod = 0;
-    for (const cachePeriod of Object.keys(cachedData).map(Number).sort((a, b) => b - a)) {
+    for (const cachePeriod of Object.keys(cachedData)
+      .map(Number)
+      .sort((a, b) => b - a)) {
       if (cachePeriod < Number(weeks)) {
         cachedPeriod = cachePeriod;
         break;
@@ -272,10 +310,14 @@ async function generateReportForTimePeriods(repoOwner: string, periods: Record<n
 
     if (cachedPeriodData && Object.keys(cachedPeriodData).length > 0) {
       const additionalEndDate = new Date(endDate);
-      additionalEndDate.setDate(endDate.getDate() - (cachedPeriod) * 7);
+      additionalEndDate.setDate(endDate.getDate() - cachedPeriod * 7);
 
       // Fetch additional data
-      report = await aggregateMetricsByDateRange(repoOwner, additionalEndDate, endDate);
+      report = await aggregateMetricsByDateRange(
+        repoOwner,
+        additionalEndDate,
+        endDate
+      );
 
       // Merge with cached data
       Object.entries(cachedPeriodData).forEach(([user, data]) => {
@@ -294,19 +336,77 @@ async function generateReportForTimePeriods(repoOwner: string, periods: Record<n
     }
     cachedData[+weeks] = report;
 
+    const commitsData = Object.entries(report)
+    .map((item: any) => {
+      return {
+        author: item[0],
+        commits: item[1].commits,
+      };
+    })
+    .sort((a, b) => b.commits - a.commits);
+
+    const mergedPrsData = Object.entries(report)
+      .map((item: any) => {
+        return {
+          author: item[0],
+          pullRequests: item[1].pullRequests,
+        };
+      })
+      .sort((a, b) => b.pullRequests - a.pullRequests);
+
+      const prsReviewsData = Object.entries(report)
+      .map((item: any) => {
+        return {
+          author: item[0],
+          score: item[1].score,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    //aggerigate ranking
+    // Step 1: Create a function to calculate the aggregate ranking
+    const aggregateRanking = (): RankedUser[] => {
+      const rankingMap: { [key: string]: number } = {};
+    
+      const sumIndexes = (array: any[]) => {
+        array.forEach((item, index) => {
+          const user = item.author;
+          if (!rankingMap[user]) rankingMap[user] = 0;
+          rankingMap[user] += index;
+        });
+      };
+    
+      sumIndexes(commitsData);
+      sumIndexes(mergedPrsData);
+      sumIndexes(prsReviewsData);
+    
+      return Object.entries(rankingMap)
+        .map(([user, totalIndex]) => ({ user, totalIndex }))
+        .sort((a, b) => a.totalIndex - b.totalIndex);
+    };
+    
+    // Step 4: Use the aggregate ranking for display
+    rankedUsers = aggregateRanking();
+    // console.log(rankedUsers, 'Rank Users List')
+
     const sheetData: any[] = [];
-    sheetData.push(['User', 'Commits', 'Pull Requests', 'Reviews', 'Score']);
-    Object.entries(report).forEach(([user, data]: [string, any]) => {
+    sheetData.push(["Commits", "Merged PRS", "PRS Reviews"]);
+    Object.entries(report).forEach(([user, data]: [string, any], index) => {
       sheetData.push([
-        user,
-        data.commits,
-        data.pullRequests,
-        data.reviews,
-        data.score,
+        `${index + 1}.  ${commitsData[index].author} - ${commitsData[index].commits}`,
+        // `${index + 1} ${commitsData[index].author}`,
+        `${index + 1}.  ${mergedPrsData[index].author} -  ${mergedPrsData[index].pullRequests}`,
+        `${index + 1}.  ${prsReviewsData[index].author} -  ${parseFloat(prsReviewsData[index].score.toFixed(1))}`,
+        
       ]);
     });
 
     const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
+    worksheet['!cols'] = [
+      { wch: 20 }, 
+      { wch: 20 }, 
+      { wch: 20 },
+    ];
     xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
 
     // Update progress bar
@@ -317,33 +417,39 @@ async function generateReportForTimePeriods(repoOwner: string, periods: Record<n
   bar.stop();
 
   // Send the report via email
-  const attachment = xlsx.write(workbook, { type: 'buffer', bookType: 'xlsx' });
-  await sendEmailWithAttachment(attachment);
+  const attachment = xlsx.write(workbook, { type: "buffer", bookType: "xlsx" });
+  await sendEmailWithAttachment(attachment, rankedUsers);
 }
 
 // Function to send an email with the report attached
-async function sendEmailWithAttachment(attachment: Buffer) {
+async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: RankedUser[]) {
   // Create a transporter object using SMTP transport
   const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    service: "gmail",
     auth: {
       user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASSWORD,
+      pass: process.env.EMAIL_PASS,
     },
   });
+
+
+  const rankedListString = aggregateRanking.map((rank, index) => {
+    return `${index + 1}.  ${rank.user}`;
+  }).join('\n');
 
   // Send an email with the report attached
   const info = await transporter.sendMail({
     from: process.env.EMAIL_USER,
     to: process.env.EMAIL_METRICS_TO_USER,
-    subject: 'GitHub Metrics Report',
-    text: 'Please find the attached GitHub metrics report.',
+    subject: "GitHub Metrics Report",
+    text: `${rankedListString}`,
     attachments: [
       {
-        filename: 'GitHub_Metrics_Report.xlsx',
+        filename: "GitHub_Metrics_Report.xlsx",
         content: attachment,
-        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-      }
+        contentType:
+          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      },
     ],
   });
 
@@ -352,7 +458,7 @@ async function sendEmailWithAttachment(attachment: Buffer) {
 
 // Schedule the report generation to run daily at midnight
 cron.schedule("0 0 * * 0", () => {
-  console.log('Starting report generation...');
+  console.log("Starting report generation...");
   generateReportForTimePeriods(repoOwner, periods).catch(console.error);
 });
 
