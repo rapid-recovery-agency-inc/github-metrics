@@ -5,6 +5,9 @@ import cron from "node-cron";
 import xlsx from "xlsx";
 import cliProgress from "cli-progress";
 import fs from "fs";
+import fetch from 'node-fetch';
+
+const GITHUB_GRAPHQL_API = "https://api.github.com/graphql";
 
 // Load environment variables
 dotenv.config();
@@ -81,40 +84,130 @@ function getDateIntervals(
 }
 
 // Function to fetch all commits within a given date range using date intervals
+
 async function fetchCommitsInDateRange(
   repoOwner: string,
   startDate: Date,
   endDate: Date
 ) {
   const allCommits = [];
-  const dateIntervals = getDateIntervals(startDate, endDate, 5); // 5-day interval to avoid the 1000 result limit
+  const dateIntervals = getDateIntervals(startDate, endDate, 5); // 5-day interval to avoid limits
+  const MAX_RETRIES = 3;
 
   for (const { since, until } of dateIntervals) {
-    let page = 1;
+    let cursor: string | null = null;
     let hasMore = true;
 
     while (hasMore) {
-      try {
-        const response = await octokit.search.commits({
-          q: `org:${repoOwner} author-date:${since}..${until}`,
-          per_page: 100,
-          page,
-        });
+      const query = `
+        query($repoOwner: String!, $since: GitTimestamp, $until: GitTimestamp, $cursor: String) {
+          repositoryOwner(login: $repoOwner) {
+            repositories(first: 50) {
+              edges {
+                node {
+                  name
+                  defaultBranchRef {
+                    target {
+                      ... on Commit {
+                        history(first: 50, since: $since, until: $until, after: $cursor) {
+                          edges {
+                            node {
+                              oid
+                              committedDate
+                              additions
+                              deletions
+                              changedFiles
+                              message
+                              author {
+                                name
+                                email
+                              }
+                            }
+                          }
+                          pageInfo {
+                            hasNextPage
+                            endCursor
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
 
-        // Handle rate limiting
-        await handleRateLimit(response);
+      const variables = { repoOwner, since, until, cursor };
 
-        allCommits.push(...response.data.items);
+      let retries = MAX_RETRIES;
+      let success = false;
 
-        // Check if there are more pages
-        hasMore = response.data.items.length === 100;
-        page += 1;
-      } catch (error: any) {
-        if (error.status === 403) {
-          console.log("\n Rate limit error detected. Retrying after reset...");
-          await handleRateLimit(error.response);
-        } else {
-          throw error;
+      while (retries > 0 && !success) {
+        try {
+          const response = await fetch(GITHUB_GRAPHQL_API, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+            },
+            body: JSON.stringify({
+              query,
+              variables,
+            }),
+          });
+
+          // Check rate limit headers
+          const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+          const rateLimitReset = response.headers.get("x-ratelimit-reset");
+
+          if (rateLimitRemaining === "0" && rateLimitReset) {
+            const resetTime = parseInt(rateLimitReset, 10) * 1000;
+            const currentTime = Date.now();
+            const waitTime = resetTime - currentTime;
+            if (waitTime > 0) {
+              console.log(`Rate limit exceeded. Waiting for ${waitTime / 1000} seconds...`);
+              await new Promise((resolve) => setTimeout(resolve, waitTime));
+            }
+          }
+
+          const result: any = await response.json();
+
+          if (result.errors) {
+            console.error("GraphQL errors:", result.errors);
+            throw new Error("GraphQL query failed");
+          }
+
+          const repositories = result.data.repositoryOwner.repositories.edges;
+
+          for (const repo of repositories) {
+            const commitHistory = repo.node.defaultBranchRef.target.history;
+            const commits = commitHistory.edges.map((edge: any) => edge.node);
+            allCommits.push(...commits);
+
+            // Check if there are more commits to fetch
+            hasMore = commitHistory.pageInfo.hasNextPage;
+            cursor = commitHistory.pageInfo.endCursor;
+          }
+
+          success = true; // Mark success if no errors occurred
+
+          // Exit loop if no more pages are available
+          if (!hasMore) break;
+
+        } catch (error:any) {
+          retries--;
+          console.error(`Error fetching commits: ${error.message}, Retries left: ${retries}`);
+
+          if (retries === 0) {
+            throw new Error("Failed after multiple retries");
+          }
+
+          // Exponential backoff before retrying
+          const retryWaitTime = (MAX_RETRIES - retries) * 1000;
+          console.log(`Retrying in ${retryWaitTime / 1000} seconds...`);
+          await new Promise((resolve) => setTimeout(resolve, retryWaitTime));
         }
       }
     }
@@ -166,45 +259,126 @@ async function fetchPullRequestsInDateRange(
   return allPullRequests;
 }
 
-// Function to fetch reviews for a specific pull request
 async function fetchReviewsForPR(
   repoOwner: string,
   repoName: string,
   prNumber: number
 ) {
-  const allReviews = [];
-  let page = 1;
+  const allReviews: any[] = [];
+  const allReviewThreads: any[] = [];
+  const MAX_RETRIES = 3;
+
+  let cursor: string | null = null;
   let hasMore = true;
 
   while (hasMore) {
-    try {
-      const response = await octokit.pulls.listReviews({
-        owner: repoOwner,
-        repo: repoName,
-        pull_number: prNumber,
-        per_page: 100,
-        page,
-      });
 
-      // Handle rate limiting
-      await handleRateLimit(response);
+  const query = `
+  query($owner: String!, $repo: String!, $pullNumber: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pullNumber) {
+        reviews(first: 100, after: $cursor) {
+          edges {
+            node {
+              author {
+                login
+              }
+              body
+              createdAt
+              state
+              commit {
+                oid
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+        reviewThreads(first: 100) {
+          edges {
+            node {
+              id
+              comments(first: 100) {
+                edges {
+                  node {
+                    author {
+                      login
+                    }
+                    body
+                    createdAt
+                  }
+                }
+              }
+              isResolved
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+    const variables = {
+      owner: repoOwner,
+      repo: repoName,
+      pullNumber: prNumber,
+      cursor
+    };
 
-      allReviews.push(...response.data);
+    let retries = MAX_RETRIES;
+    let success = false;
 
-      // Check if there are more pages
-      hasMore = response.data.length === 100;
-      page += 1;
-    } catch (error: any) {
-      if (error.status === 403) {
-        console.log("\n Rate limit error detected. Retrying after reset...");
-        await handleRateLimit(error.response);
-      } else {
-        throw error;
+    while (retries > 0 && !success) {
+      try {
+        const response = await fetch(GITHUB_GRAPHQL_API, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`
+          },
+          body: JSON.stringify({ query, variables })
+        });
+
+        // Handle rate limiting
+        await handleRateLimit(response);
+
+        const result:any = await response.json();
+
+        if (result.errors) {
+          console.error("GraphQL errors:", result.errors);
+          throw new Error("GraphQL query failed");
+        }
+
+        const reviews = result.data.repository.pullRequest.reviews;
+        const reviewThreads = result.data.repository.pullRequest.reviewThreads;
+
+        allReviews.push(...reviews.edges.map((edge: any) => edge.node));
+        allReviewThreads.push(...reviewThreads.edges.map((edge: any) => edge.node));
+
+        // Check if there are more reviews to fetch
+        hasMore = reviews.pageInfo.hasNextPage;
+        cursor = reviews.pageInfo.endCursor;
+
+        success = true; // Mark success if no errors occurred
+
+      } catch (error: any) {
+        retries--;
+        console.error(`Error fetching reviews: ${error.message}, Retries left: ${retries}`);
+
+        if (retries === 0) {
+          throw new Error("Failed after multiple retries");
+        }
+
+        // Exponential backoff before retrying
+        const retryWaitTime = (MAX_RETRIES - retries) * 1000;
+        console.log(`Retrying in ${retryWaitTime / 1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, retryWaitTime));
       }
     }
   }
 
-  return allReviews;
+  return { reviews: allReviews, reviewThreads: allReviewThreads };
 }
 
 // Function to aggregate metrics for a specific date range
@@ -224,14 +398,24 @@ async function aggregateMetricsByDateRange(
 
   // Aggregate commit metrics by user
   commits.forEach((commit) => {
-    const author = commit.author?.login || "Unknown";
+    if (!commit || !commit.author) {
+      console.log("Invalid commit data:", commit);
+      return; // Skip this commit if data is missing
+    }
+    const author =   commit.author?.name || "Unknown";
+    if (author === "Unknown") {
+      console.log("Unknown commit author:", commit);
+    }
     userMetrics[author] = userMetrics[author] || {
       commits: 0,
       pullRequests: 0,
       reviews: 0,
       score: 0,
     };
-    userMetrics[author].commits += 1;
+    const additions = commit.additions || 0;
+    const deletions = commit.deletions || 0;
+    userMetrics[author].commits += additions + deletions;
+    // userMetrics[author].commits += 1;
   });
 
   // Aggregate pull request metrics by user
@@ -250,10 +434,10 @@ async function aggregateMetricsByDateRange(
     userMetrics[author].pullRequests += 1;
 
     // Fetch reviews for the current PR
-    const reviews = await fetchReviewsForPR(repoOwner, repoName, pr.number);
+    const {reviews, reviewThreads} = await fetchReviewsForPR(repoOwner, repoName, pr.number);
 
     reviews.forEach((review) => {
-      const reviewer = review.user?.login || "Unknown";
+      const reviewer = review.author?.login || "Unknown";
       userMetrics[reviewer] = userMetrics[reviewer] || {
         commits: 0,
         pullRequests: 0,
@@ -267,10 +451,19 @@ async function aggregateMetricsByDateRange(
       // Add 1 point for the review
       userMetrics[reviewer].score += 1;
 
-      // Add 0.1 points for each review comment
-      if (review.body) {
-        userMetrics[reviewer].score += 0.1;
-      }
+      reviewThreads.forEach((reviewThread) => {
+        const threadAuthor = reviewThread?.comments?.edges[0]?.node?.author?.login;
+
+        userMetrics[threadAuthor] = userMetrics[threadAuthor] || {
+          commits: 0,
+          pullRequests: 0,
+          reviews: 0,
+          score: 0,
+        };
+
+        userMetrics[threadAuthor].score += 0.1;
+      })
+
     });
   }
 
