@@ -4,7 +4,6 @@ import nodemailer from "nodemailer";
 import cron from "node-cron";
 import xlsx from "xlsx";
 import cliProgress from "cli-progress";
-import fs from "fs";
 import fetch from 'node-fetch';
 
 const GITHUB_GRAPHQL_API = "https://api.github.com/graphql";
