@@ -8,7 +8,6 @@ import fetch from 'node-fetch';
 
 const GITHUB_GRAPHQL_API = "https://api.github.com/graphql";
 
-// Load environment variables
 dotenv.config();
 
 interface RankedUser {
@@ -46,9 +45,6 @@ async function handleRateLimit(response: any) {
     const currentTime = new Date();
 
     const waitTime = resetTime.getTime() - currentTime.getTime();
-    console.log(
-      `\n Rate limit exceeded. Waiting for ${waitTime / 1000} seconds...`
-    );
 
     // Wait until the rate limit resets
     await new Promise((resolve) => setTimeout(resolve, waitTime));
@@ -90,7 +86,7 @@ async function fetchCommitsInDateRange(
   endDate: Date
 ) {
   const allCommits = [];
-  const dateIntervals = getDateIntervals(startDate, endDate, 5); // 5-day interval to avoid limits
+  const dateIntervals = getDateIntervals(startDate, endDate, 5);
   const MAX_RETRIES = 3;
 
   for (const { since, until } of dateIntervals) {
@@ -166,7 +162,6 @@ async function fetchCommitsInDateRange(
             const currentTime = Date.now();
             const waitTime = resetTime - currentTime;
             if (waitTime > 0) {
-              console.log(`Rate limit exceeded. Waiting for ${waitTime / 1000} seconds...`);
               await new Promise((resolve) => setTimeout(resolve, waitTime));
             }
           }
@@ -185,27 +180,20 @@ async function fetchCommitsInDateRange(
             const commits = commitHistory.edges.map((edge: any) => edge.node);
             allCommits.push(...commits);
 
-            // Check if there are more commits to fetch
             hasMore = commitHistory.pageInfo.hasNextPage;
             cursor = commitHistory.pageInfo.endCursor;
           }
 
-          success = true; // Mark success if no errors occurred
+          success = true; 
 
-          // Exit loop if no more pages are available
           if (!hasMore) break;
 
         } catch (error:any) {
-          retries--;
-          console.error(`Error fetching commits: ${error.message}, Retries left: ${retries}`);
-
           if (retries === 0) {
             throw new Error("Failed after multiple retries");
           }
 
-          // Exponential backoff before retrying
           const retryWaitTime = (MAX_RETRIES - retries) * 1000;
-          console.log(`Retrying in ${retryWaitTime / 1000} seconds...`);
           await new Promise((resolve) => setTimeout(resolve, retryWaitTime));
         }
       }
@@ -222,7 +210,7 @@ async function fetchPullRequestsInDateRange(
   endDate: Date
 ) {
   const allPullRequests = [];
-  const dateIntervals = getDateIntervals(startDate, endDate, 5); // 5-day interval to avoid the 1000 result limit
+  const dateIntervals = getDateIntervals(startDate, endDate, 5);
 
   for (const { since, until } of dateIntervals) {
     let page = 1;
@@ -246,7 +234,6 @@ async function fetchPullRequestsInDateRange(
         page += 1;
       } catch (error: any) {
         if (error.status === 403) {
-          console.log("\n Rate limit error detected. Retrying after reset...");
           await handleRateLimit(error.response);
         } else {
           throw error;
@@ -345,7 +332,6 @@ async function fetchReviewsForPR(
         const result:any = await response.json();
 
         if (result.errors) {
-          console.error("GraphQL errors:", result.errors);
           throw new Error("GraphQL query failed");
         }
 
@@ -359,19 +345,16 @@ async function fetchReviewsForPR(
         hasMore = reviews.pageInfo.hasNextPage;
         cursor = reviews.pageInfo.endCursor;
 
-        success = true; // Mark success if no errors occurred
+        success = true;
 
       } catch (error: any) {
         retries--;
-        console.error(`Error fetching reviews: ${error.message}, Retries left: ${retries}`);
 
         if (retries === 0) {
           throw new Error("Failed after multiple retries");
         }
 
-        // Exponential backoff before retrying
         const retryWaitTime = (MAX_RETRIES - retries) * 1000;
-        console.log(`Retrying in ${retryWaitTime / 1000} seconds...`);
         await new Promise(resolve => setTimeout(resolve, retryWaitTime));
       }
     }
@@ -395,16 +378,12 @@ async function aggregateMetricsByDateRange(
     endDate
   );
 
-  // Aggregate commit metrics by user
   commits.forEach((commit) => {
     if (!commit || !commit.author) {
-      console.log("Invalid commit data:", commit);
-      return; // Skip this commit if data is missing
+      return; 
     }
     const author =   commit.author?.name || "Unknown";
-    if (author === "Unknown") {
-      console.log("Unknown commit author:", commit);
-    }
+
     userMetrics[author] = userMetrics[author] || {
       commits: 0,
       pullRequests: 0,
@@ -414,10 +393,9 @@ async function aggregateMetricsByDateRange(
     const additions = commit.additions || 0;
     const deletions = commit.deletions || 0;
     userMetrics[author].commits += additions + deletions;
-    // userMetrics[author].commits += 1;
+    
   });
 
-  // Aggregate pull request metrics by user
   for (const pr of pullRequests) {
     const author = pr.user?.login || "Unknown";
     const repoName = `${pr.repository_url.split("/").pop()}`;
@@ -478,7 +456,6 @@ async function generateReportForTimePeriods(
   const endDate = new Date();
   let rankedUsers: RankedUser[] = [];
 
-  // Initialize progress bar
   bar.start(Object.keys(periods).length, 0);
 
   for (const [weeks, periodName] of Object.entries(periods)) {
@@ -523,7 +500,7 @@ async function generateReportForTimePeriods(
         }
       });
     } else {
-      // No cached data, fetch all data
+      
       report = await aggregateMetricsByDateRange(repoOwner, startDate, endDate);
     }
     cachedData[+weeks] = report;
@@ -555,8 +532,7 @@ async function generateReportForTimePeriods(
       })
       .sort((a, b) => b.score - a.score);
 
-    //aggerigate ranking
-    // Step 1: Create a function to calculate the aggregate ranking
+    //Create a function to calculate the aggregate ranking
     const aggregateRanking = (): RankedUser[] => {
       const rankingMap: { [key: string]: number } = {};
     
@@ -577,18 +553,18 @@ async function generateReportForTimePeriods(
         .sort((a, b) => a.totalIndex - b.totalIndex);
     };
     
-    // Step 4: Use the aggregate ranking for display
     rankedUsers = aggregateRanking();
-    // console.log(rankedUsers, 'Rank Users List')
 
     const sheetData: any[] = [];
-    sheetData.push(["Commits", "Merged PRS", "PRS Reviews"]);
+    sheetData.push(["Commits","No of Commits", "Merged PRS","No of Merged PRS", "PRS Reviews","No of PRS Reviews"]);
     Object.entries(report).forEach(([user, data]: [string, any], index) => {
       sheetData.push([
-        `${index + 1}.  ${commitsData[index].author} - ${commitsData[index].commits}`,
-        // `${index + 1} ${commitsData[index].author}`,
-        `${index + 1}.  ${mergedPrsData[index].author} -  ${mergedPrsData[index].pullRequests}`,
-        `${index + 1}.  ${prsReviewsData[index].author} -  ${parseFloat(prsReviewsData[index].score.toFixed(1))}`,
+        `${index + 1}.  ${commitsData[index].author}`,
+        `${commitsData[index].commits}`,
+        `${index + 1}.  ${mergedPrsData[index].author}`,
+        `${mergedPrsData[index].pullRequests}`,
+        `${index + 1}.  ${prsReviewsData[index].author}`,
+        `${parseFloat(prsReviewsData[index].score.toFixed(1))}`
         
       ]);
     });
@@ -596,16 +572,17 @@ async function generateReportForTimePeriods(
     const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
     worksheet['!cols'] = [
       { wch: 20 }, 
-      { wch: 20 }, 
+      { wch: 10 }, 
       { wch: 20 },
+      { wch: 12 }, 
+      { wch: 20 },
+      { wch: 12 },
     ];
     xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
 
-    // Update progress bar
     bar.increment();
   }
 
-  // End progress bar
   bar.stop();
 
   // Send the report via email
