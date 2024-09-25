@@ -3,3 +3,11 @@ node_modules
 .DS_Store
 dist/*
 .vscode/*
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+.env.aws.main
+.idea/
+GitHub_Metrics_Report.xlsx
+disk-cache/

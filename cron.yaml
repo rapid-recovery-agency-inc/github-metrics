@@ -1,0 +1,5 @@
+version: 1
+cron:
+  - name: 'GitHub Metric Report: Every Friday Morning ET'
+    url: '/'
+    schedule: '0 0 * * FRI'
