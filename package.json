@@ -6,6 +6,9 @@
     "start": "node --experimental-specifier-resolution=node dist/index.js",
     "start:local": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/index.ts "
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@aws-sdk/client-ses": "^3.658.0",
     "@octokit/openapi-types": "22.2.0",
