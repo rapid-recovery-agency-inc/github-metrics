@@ -38,8 +38,8 @@ const octokit = new Octokit({
 const periods: Record<number, string> = {
     2: "Last 2 Weeks",
     4: "Last 4 Weeks",
+    6: "Last 6 Weeks",
     12: "Last 12 Weeks",
-    24: "Last 24 Weeks",
 };
 
 const repoOwner = `${process.env.GITHUB_ORG}`;
