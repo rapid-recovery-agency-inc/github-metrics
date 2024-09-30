@@ -509,7 +509,7 @@ const port = process.env.PORT ?? 3000;
 
 app.use(morgan('dev'));
 
-app.get('/', async (req: Request, res: Response) => {
+app.get('/github-metric-report', async (req: Request, res: Response) => {
     console.log("Generating GitHub metrics report...");
     await generateReport(repoOwner, periods);
     res.send('Hello World!')
