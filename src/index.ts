@@ -17,6 +17,7 @@ import {
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
 import {COMMITS_CACHE, PRS_CACHE, PRS_REVIEW_CACHE} from "./cache.js";
+import morgan from "morgan";
 
 
 const GITHUB_GRAPHQL_API = "https://api.github.com/graphql";
@@ -506,11 +507,19 @@ if (!process.env.GITHUB_TOKEN || !process.env.GITHUB_ORG) {
 const app = express()
 const port = process.env.PORT ?? 3000;
 
+app.use(morgan('dev'));
+
 app.get('/', async (req: Request, res: Response) => {
     console.log("Generating GitHub metrics report...");
     await generateReport(repoOwner, periods);
     res.send('Hello World!')
 })
+
+// Catch-all route
+app.get('*', (req:Request, res: Response) => {
+    console.log("404 Not Found:", req.url);
+    res.status(404).send('Not Found'); // Or render a 404 page
+});
 
 app.listen(port, () => {
     console.log(`Example app listening on port ${port}`)
