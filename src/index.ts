@@ -48,6 +48,9 @@ const repoOwner = `${process.env.GITHUB_ORG}`;
 
 const MAX_RETRIES = 3;
 const BLACKLISTED_CODE_USERS = new Set<string>(["Waqas", "Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
+const AUTHOR_ALIAS_MAP = new Map<string, string>([
+    ["Yeferson Hidalgo", "MemiMint"]
+]);
 
 // Helper function to handle rate limits and retry after the reset time
 async function handleRateLimit(response: any) {
@@ -327,14 +330,15 @@ async function aggregateMetricsByDateRange(
         }
         let author = "Unknown";
         if (commit.authors?.nodes && commit.authors.nodes.length > 0) {
-            if(commit.authors.nodes[0].user && commit.authors.nodes[0].user.login)
+            if (commit.authors.nodes[0].user && commit.authors.nodes[0].user.login)
                 author = commit.authors.nodes[0].user.login;
         }
         if (author === "Unknown" && commit.author) {
             author = commit.author.name ?? "Unknown";
         }
-
-        // const author = commit.authors?.nodes[0]?.user?.login || "Unknown";
+        if (AUTHOR_ALIAS_MAP.has(author)) {
+            author = AUTHOR_ALIAS_MAP.get(author) || author;
+        }
         if (BLACKLISTED_CODE_USERS.has(author)) {
             return;
         }
@@ -492,7 +496,14 @@ async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: Ran
         return `${index + 1}.  ${rank.user} <br/>`;
     }).join('\n');
     await sendTemplateEmail({
-        users: [{email: 'alacret@insightt.io'}, {email: 'bhamilton@insightt.io'}, {email: 'ysouki@insightt.io'}, {email: 'jziebro@insightt.io'}, {email: 'lpena@insightt.io'}],
+        users: [
+            {email: 'alacret@insightt.io'},
+            {email: 'ysouki@insightt.io'},
+            {email: 'jziebro@insightt.io'},
+            {email: 'bhamilton@insightt.io'},
+            {email: 'aovalle@insightt.io'},
+            {email: 'lpena@insightt.io'}
+        ],
         subject: "GitHub Metrics Report",
         body: `${rankedListString}`,
         attachments: [
