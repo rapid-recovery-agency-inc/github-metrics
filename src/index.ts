@@ -47,7 +47,7 @@ const repoOwner = `${process.env.GITHUB_ORG}`;
 
 
 const MAX_RETRIES = 3;
-const BLACKLISTED_CODE_USERS = new Set<string>(["Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1"]);
+const BLACKLISTED_CODE_USERS = new Set<string>(["Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
 
 // Helper function to handle rate limits and retry after the reset time
 async function handleRateLimit(response: any) {
@@ -322,10 +322,19 @@ async function aggregateMetricsByDateRange(
         endDate
     );
     commits.forEach((commit) => {
-        if (!commit || !commit.authors?.nodes.length) {
+        if (!commit) {
             return;
         }
-        const author = commit.authors?.nodes[0]?.user?.login || "Unknown";
+        let author = "Unknown";
+        if (commit.authors?.nodes && commit.authors.nodes.length > 0) {
+            if(commit.authors.nodes[0].user && commit.authors.nodes[0].user.login)
+                author = commit.authors.nodes[0].user.login;
+        }
+        if (author === "Unknown" && commit.author) {
+            author = commit.author.name ?? "Unknown";
+        }
+
+        // const author = commit.authors?.nodes[0]?.user?.login || "Unknown";
         if (BLACKLISTED_CODE_USERS.has(author)) {
             return;
         }
@@ -516,7 +525,7 @@ app.get('/github-metric-report', async (req: Request, res: Response) => {
 })
 
 // Catch-all route
-app.get('*', (req:Request, res: Response) => {
+app.get('*', (req: Request, res: Response) => {
     console.log("404 Not Found:", req.url);
     res.status(404).send('Not Found'); // Or render a 404 page
 });

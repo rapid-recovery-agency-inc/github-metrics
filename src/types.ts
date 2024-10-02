@@ -10,6 +10,10 @@ export interface GraphQLCommit {
     deletions: number;
     changedFiles: number;
     message: string;
+    author?: {
+        name: string;
+        email: string;
+    }
     authors?:{
         nodes:{
             user:{
