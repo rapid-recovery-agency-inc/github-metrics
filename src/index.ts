@@ -47,7 +47,7 @@ const repoOwner = `${process.env.GITHUB_ORG}`;
 
 
 const MAX_RETRIES = 3;
-const BLACKLISTED_CODE_USERS = new Set<string>(["Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
+const BLACKLISTED_CODE_USERS = new Set<string>(["Waqas", "Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
 
 // Helper function to handle rate limits and retry after the reset time
 async function handleRateLimit(response: any) {
