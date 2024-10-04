@@ -49,7 +49,8 @@ const repoOwner = `${process.env.GITHUB_ORG}`;
 const MAX_RETRIES = 3;
 const BLACKLISTED_CODE_USERS = new Set<string>(["Waqas", "Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
 const AUTHOR_ALIAS_MAP = new Map<string, string>([
-    ["Yeferson Hidalgo", "MemiMint"]
+    ["Yeferson Hidalgo", "MemiMint"],
+    ["Jonathan Miles", "jonmiles"]
 ]);
 
 // Helper function to handle rate limits and retry after the reset time
@@ -530,6 +531,12 @@ const port = process.env.PORT ?? 3000;
 app.use(morgan('dev'));
 
 app.get('/github-metric-report', async (req: Request, res: Response) => {
+    console.log("Generating GitHub metrics report...");
+    await generateReport(repoOwner, periods);
+    res.send('Hello World!')
+})
+
+app.post('/github-metric-report', async (req: Request, res: Response) => {
     console.log("Generating GitHub metrics report...");
     await generateReport(repoOwner, periods);
     res.send('Hello World!')
