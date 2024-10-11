@@ -542,7 +542,6 @@ app.post('/github-metric-report', async (req: Request, res: Response) => {
     res.send('Hello World!')
 })
 
-// Catch-all route
 app.get('*', (req: Request, res: Response) => {
     console.log("404 Not Found:", req.url);
     res.status(404).send('Not Found'); // Or render a 404 page
