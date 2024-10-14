@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import xlsx from "xlsx";
 import fetch from 'node-fetch';
 import express, {Request, Response} from "express";
-import {getDateIntervals} from "./utils.js";
+import {getDateIntervals, sleep, sleepInSeconds} from "./utils.js";
 import {COMMITS_QUERY} from "./graphql-queries.js";
 import {
     GraphQLCommit,
@@ -47,6 +47,7 @@ const repoOwner = `${process.env.GITHUB_ORG}`;
 
 
 const MAX_RETRIES = 3;
+const WAIT_SECONDS_BETWEEN_RETRIES = 5;
 const BLACKLISTED_CODE_USERS = new Set<string>(["Waqas", "Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
 const AUTHOR_ALIAS_MAP = new Map<string, string>([
     ["Yeferson Hidalgo", "MemiMint"],
@@ -92,54 +93,50 @@ async function fetchCommitsInDateRange(
             let retries = MAX_RETRIES;
             let success = false;
             while (retries > 0 && !success) {
-                try {
-                    const response = await fetch(GITHUB_GRAPHQL_API, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                        },
-                        body: JSON.stringify({
-                            query: COMMITS_QUERY,
-                            variables,
-                        }),
-                    });
-                    // Check rate limit headers
-                    const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
-                    const rateLimitReset = response.headers.get("x-ratelimit-reset");
-                    if (rateLimitRemaining === "0" && rateLimitReset) {
-                        const resetTime = parseInt(rateLimitReset, 10) * 1000;
-                        const currentTime = Date.now();
-                        const waitTime = resetTime - currentTime;
-                        if (waitTime > 0) {
-                            await new Promise((resolve) => setTimeout(resolve, waitTime));
-                        }
+                const response = await fetch(GITHUB_GRAPHQL_API, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                    },
+                    body: JSON.stringify({
+                        query: COMMITS_QUERY,
+                        variables,
+                    }),
+                });
+                // Check rate limit headers
+                const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+                const rateLimitReset = response.headers.get("x-ratelimit-reset");
+                if (rateLimitRemaining === "0" && rateLimitReset) {
+                    const resetTime = parseInt(rateLimitReset, 10) * 1000;
+                    const currentTime = Date.now();
+                    const waitTime = resetTime - currentTime;
+                    if (waitTime > 0) {
+                        console.log("DEBUG:fetchCommitsInDateRange:waiting...", (waitTime / 1000), ' seconds', await response.json());
+                        await sleep(waitTime);
+                        continue;
                     }
-                    const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
-                    if (result.errors) {
-                        console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors);
-                        throw new Error("GraphQL query failed");
-                    }
-                    const repositories = result.data.repositoryOwner.repositories.edges;
-                    for (const repo of repositories) {
-                        const history = repo.node.defaultBranchRef.target.history;
-                        const commits = history.edges.map((edge: any) => edge.node);
-                        if (commits.length > 0) {
-                            allCommits.push(...commits);
-                            COMMITS_CACHE.set(cacheKey, commits);
-                        }
-                        hasMore = history.pageInfo.hasNextPage;
-                        cursor = history.pageInfo.endCursor;
-                    }
-                    success = true;
-                    if (!hasMore) break;
-                } catch (error: any) {
-                    if (retries === 0) {
-                        throw new Error("Failed after multiple retries");
-                    }
-                    const retryWaitTime = (MAX_RETRIES - retries) * 1000;
-                    await new Promise((resolve) => setTimeout(resolve, retryWaitTime));
                 }
+                const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
+                if (result.errors) {
+                    console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
+                    const errorsNames = result.errors.map((error) => error.type).join(", ");
+                    throw new Error(errorsNames);
+                }
+                const repositories = result.data.repositoryOwner.repositories.edges;
+                for (const repo of repositories) {
+                    if (!repo.node.defaultBranchRef) continue;
+                    const history = repo.node.defaultBranchRef.target.history;
+                    const commits = history.edges.map((edge: any) => edge.node);
+                    if (commits.length > 0) {
+                        allCommits.push(...commits);
+                        COMMITS_CACHE.set(cacheKey, commits);
+                    }
+                    hasMore = history.pageInfo.hasNextPage;
+                    cursor = history.pageInfo.endCursor;
+                }
+                success = true;
+                if (!hasMore) break;
             }
         }
     }
