@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 import xlsx from "xlsx";
 import fetch from 'node-fetch';
 import express, {Request, Response} from "express";
-import {getDateIntervals, sleep, sleepInSeconds} from "./utils.js";
+import {getDateIntervals, sleep} from "./utils.js";
 import {COMMITS_QUERY} from "./graphql-queries.js";
 import {
     GraphQLCommit,
@@ -90,55 +90,47 @@ async function fetchCommitsInDateRange(
         let hasMore = true;
         while (hasMore) {
             const variables = {repoOwner, since, until, cursor};
-            let retries = MAX_RETRIES;
-            let success = false;
-            while (retries > 0 && !success) {
-                const response = await fetch(GITHUB_GRAPHQL_API, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                    },
-                    body: JSON.stringify({
-                        query: COMMITS_QUERY,
-                        variables,
-                    }),
-                });
-                // Check rate limit headers
-                const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
-                const rateLimitReset = response.headers.get("x-ratelimit-reset");
-                if (rateLimitRemaining === "0" && rateLimitReset) {
-                    const resetTime = parseInt(rateLimitReset, 10) * 1000;
-                    const currentTime = Date.now();
-                    const waitTime = resetTime - currentTime;
-                    if (waitTime > 0) {
-                        console.log("DEBUG:fetchCommitsInDateRange:waiting...", (waitTime / 1000), ' seconds', await response.json());
-                        await sleep(waitTime);
-                        continue;
-                    }
+            const response = await fetch(GITHUB_GRAPHQL_API, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                },
+                body: JSON.stringify({
+                    query: COMMITS_QUERY,
+                    variables,
+                }),
+            });
+            // Check rate limit headers
+            const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+            const rateLimitReset = response.headers.get("x-ratelimit-reset");
+            if (rateLimitRemaining === "0" && rateLimitReset) {
+                const resetTime = parseInt(rateLimitReset, 10) * 1000;
+                const currentTime = Date.now();
+                const waitTime = resetTime - currentTime;
+                if (waitTime > 0) {
+                    await sleep(waitTime);
+                    continue;
                 }
-                const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
-                if (result.errors) {
-                    console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
-                    const errorsNames = result.errors.map((error) => error.type).join(", ");
-                    throw new Error(errorsNames);
+            }
+            const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
+            if (result.errors) {
+                console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
+                throw new Error(result.errors.map((error) => error.type).join(", "));
+            }
+            const repositories = result.data.repositoryOwner.repositories.edges;
+            for (const repo of repositories) {
+                if (!repo.node.defaultBranchRef) continue;
+                const history = repo.node.defaultBranchRef.target.history;
+                const commits = history.edges.map((edge) => edge.node);
+                if (commits.length > 0) {
+                    allCommits.push(...commits);
                 }
-                const repositories = result.data.repositoryOwner.repositories.edges;
-                for (const repo of repositories) {
-                    if (!repo.node.defaultBranchRef) continue;
-                    const history = repo.node.defaultBranchRef.target.history;
-                    const commits = history.edges.map((edge: any) => edge.node);
-                    if (commits.length > 0) {
-                        allCommits.push(...commits);
-                        COMMITS_CACHE.set(cacheKey, commits);
-                    }
-                    hasMore = history.pageInfo.hasNextPage;
-                    cursor = history.pageInfo.endCursor;
-                }
-                success = true;
-                if (!hasMore) break;
+                hasMore = history.pageInfo.hasNextPage;
+                cursor = history.pageInfo.endCursor;
             }
         }
+        COMMITS_CACHE.set(cacheKey, allCommits);
     }
     return allCommits;
 }
@@ -498,7 +490,7 @@ async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: Ran
             {email: 'alacret@insightt.io'},
             {email: 'ysouki@insightt.io'},
             {email: 'jziebro@insightt.io'},
-            {email: 'bhamilton@insightt.io'},
+            // {email: 'bhamilton@insightt.io'},
             {email: 'aovalle@insightt.io'},
             {email: 'lpena@insightt.io'}
         ],
