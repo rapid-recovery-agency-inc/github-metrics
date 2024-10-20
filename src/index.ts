@@ -88,48 +88,55 @@ async function fetchCommitsInDateRange(
         }
         let cursor: string | null = null;
         let hasMore = true;
-        while (hasMore) {
-            const variables = {repoOwner, since, until, cursor};
-            const response = await fetch(GITHUB_GRAPHQL_API, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                },
-                body: JSON.stringify({
-                    query: COMMITS_QUERY,
-                    variables,
-                }),
-            });
-            // Check rate limit headers
-            const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
-            const rateLimitReset = response.headers.get("x-ratelimit-reset");
-            if (rateLimitRemaining === "0" && rateLimitReset) {
-                const resetTime = parseInt(rateLimitReset, 10) * 1000;
-                const currentTime = Date.now();
-                const waitTime = resetTime - currentTime;
-                if (waitTime > 0) {
-                    await sleep(waitTime);
-                    continue;
+        mainLoop:
+            while (hasMore) {
+                const variables = {repoOwner, since, until, cursor};
+                const response = await fetch(GITHUB_GRAPHQL_API, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                    },
+                    body: JSON.stringify({
+                        query: COMMITS_QUERY,
+                        variables,
+                    }),
+                });
+                // Check rate limit headers
+                const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+                const rateLimitReset = response.headers.get("x-ratelimit-reset");
+                if (rateLimitRemaining === "0" && rateLimitReset) {
+                    const resetTime = parseInt(rateLimitReset, 10) * 1000;
+                    const currentTime = Date.now();
+                    const waitTime = resetTime - currentTime;
+                    if (waitTime > 0) {
+                        await sleep(waitTime);
+                        continue;
+                    }
+                }
+                const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
+                if (result.errors) {
+                    console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
+                    for (let i = 0; i < result.errors.length; i++) {
+                        const error = result.errors[i];
+                        if (error.type === "RATE_LIMITED") {
+                            continue mainLoop;
+                        }
+                    }
+                    throw new Error(result.errors.map((error) => error.type).join(", "));
+                }
+                const repositories = result.data.repositoryOwner.repositories.edges;
+                for (const repo of repositories) {
+                    if (!repo.node.defaultBranchRef) continue;
+                    const history = repo.node.defaultBranchRef.target.history;
+                    const commits = history.edges.map((edge) => edge.node);
+                    if (commits.length > 0) {
+                        allCommits.push(...commits);
+                    }
+                    hasMore = history.pageInfo.hasNextPage;
+                    cursor = history.pageInfo.endCursor;
                 }
             }
-            const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
-            if (result.errors) {
-                console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
-                throw new Error(result.errors.map((error) => error.type).join(", "));
-            }
-            const repositories = result.data.repositoryOwner.repositories.edges;
-            for (const repo of repositories) {
-                if (!repo.node.defaultBranchRef) continue;
-                const history = repo.node.defaultBranchRef.target.history;
-                const commits = history.edges.map((edge) => edge.node);
-                if (commits.length > 0) {
-                    allCommits.push(...commits);
-                }
-                hasMore = history.pageInfo.hasNextPage;
-                cursor = history.pageInfo.endCursor;
-            }
-        }
         COMMITS_CACHE.set(cacheKey, allCommits);
     }
     return allCommits;
