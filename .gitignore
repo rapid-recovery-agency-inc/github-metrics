@@ -11,3 +11,4 @@ dist/*
 .idea/
 GitHub_Metrics_Report.xlsx
 disk-cache/
+.env
