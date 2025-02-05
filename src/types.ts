@@ -18,7 +18,7 @@ export interface GraphQLCommit {
         nodes:{
             user:{
                 login: string;
-            }
+            } | null
         }[]
     };
 };
@@ -65,7 +65,7 @@ export interface RestIssueAndPullRequest {
     state: string;
     created_at: string;
     closed_at: string;
-
+    pull_request: any;
 }
 
 export interface ReviewsForPullRequest {
@@ -102,4 +102,16 @@ export interface GraphQLReviewThreadNode {
     edges: {
         node: GraphQLReviewThread
     }[]
+}
+
+export interface AggregateCommits {
+    additions: number;
+    deletions: number;
+}
+
+export interface AggregateMetrics {
+    commits: number;
+    pullRequests: number;
+    reviews: number;
+    score: number;
 }

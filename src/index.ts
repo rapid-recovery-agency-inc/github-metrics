@@ -2,12 +2,9 @@ import {Octokit} from "octokit";
 import dotenv from "dotenv";
 import xlsx from "xlsx";
 import fetch from 'node-fetch';
-import express, {Request, Response} from "express";
-import {getDateIntervals, sleep} from "./utils.js";
-import {COMMITS_QUERY} from "./graphql-queries.js";
+import {getDateIntervals} from "./utils.js";
 import {
-    GraphQLCommit,
-    GraphQLCommitResponse,
+    AggregateMetrics,
     GraphQLReview,
     GraphQLReviewNode,
     GraphQLReviewThread,
@@ -16,11 +13,10 @@ import {
     ReviewsForPullRequest
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
-import {COMMITS_CACHE, PRS_CACHE, PRS_REVIEW_CACHE} from "./cache.js";
-import morgan from "morgan";
+import {PRS_CACHE, PRS_REVIEW_CACHE} from "./cache.js";
+import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API} from "./constants";
+import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
 
-
-const GITHUB_GRAPHQL_API = "https://api.github.com/graphql";
 
 dotenv.config();
 
@@ -44,12 +40,7 @@ const PERIODS: Record<number, string> = {
 };
 
 const MAX_RETRIES = 3;
-const WAIT_SECONDS_BETWEEN_RETRIES = 5;
-const BLACKLISTED_CODE_USERS = new Set<string>(["Waqas", "Fullstack900", "ghost", "dependabot[bot]", "Unknown", "nicolas-toledo", "anjelysleal", "juansebasmarin", "YamilaChan", "kaikrmen", "MetalMagno", "aovallegalan", "shedeed1", "YamilaChan"]);
-const AUTHOR_ALIAS_MAP = new Map<string, string>([
-    ["Yeferson Hidalgo", "MemiMint"],
-    ["Jonathan Miles", "jonmiles"]
-]);
+
 
 // Helper function to handle rate limits and retry after the reset time
 async function handleRateLimit(response: any) {
@@ -68,76 +59,6 @@ async function handleRateLimit(response: any) {
 
 // Function to fetch all commits within a given date range using date intervals
 
-async function fetchCommitsInDateRange(
-    repoOwner: string,
-    startDate: Date,
-    endDate: Date
-) {
-    console.log("DEBUG:fetchCommitsInDateRange:", repoOwner, startDate, endDate);
-    const allCommits: GraphQLCommit[] = [];
-    const dateIntervals = getDateIntervals(startDate, endDate);
-    for (const {since, until} of dateIntervals) {
-        const cacheKey = `${repoOwner}-${since}-${until}`;
-        const cachedResult = COMMITS_CACHE.get<GraphQLCommit[]>(cacheKey);
-        if (cachedResult) {
-            allCommits.push(...cachedResult);
-            continue;
-        }
-        let cursor: string | null = null;
-        let hasMore = true;
-        mainLoop:
-            while (hasMore) {
-                const variables = {repoOwner, since, until, cursor};
-                const response = await fetch(GITHUB_GRAPHQL_API, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                    },
-                    body: JSON.stringify({
-                        query: COMMITS_QUERY,
-                        variables,
-                    }),
-                });
-                // Check rate limit headers
-                const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
-                const rateLimitReset = response.headers.get("x-ratelimit-reset");
-                if (rateLimitRemaining === "0" && rateLimitReset) {
-                    const resetTime = parseInt(rateLimitReset, 10) * 1000;
-                    const currentTime = Date.now();
-                    const waitTime = resetTime - currentTime;
-                    if (waitTime > 0) {
-                        await sleep(waitTime);
-                        continue;
-                    }
-                }
-                const result: GraphQLCommitResponse = (await response.json()) as GraphQLCommitResponse;
-                if (result.errors) {
-                    console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
-                    for (let i = 0; i < result.errors.length; i++) {
-                        const error = result.errors[i];
-                        if (error.type === "RATE_LIMITED") {
-                            continue mainLoop;
-                        }
-                    }
-                    throw new Error(result.errors.map((error) => error.type).join(", "));
-                }
-                const repositories = result.data.repositoryOwner.repositories.edges;
-                for (const repo of repositories) {
-                    if (!repo.node.defaultBranchRef) continue;
-                    const history = repo.node.defaultBranchRef.target.history;
-                    const commits = history.edges.map((edge) => edge.node);
-                    if (commits.length > 0) {
-                        allCommits.push(...commits);
-                    }
-                    hasMore = history.pageInfo.hasNextPage;
-                    cursor = history.pageInfo.endCursor;
-                }
-            }
-        COMMITS_CACHE.set(cacheKey, allCommits);
-    }
-    return allCommits;
-}
 
 // Function to fetch all pull requests within a given date range using date intervals
 async function fetchPullRequestsInDateRange(
@@ -147,7 +68,7 @@ async function fetchPullRequestsInDateRange(
 ) {
     console.log("DEBUG:fetchPullRequestsInDateRange:", repoOwner, startDate, endDate);
     const allPullRequests: RestIssueAndPullRequest[] = [];
-    const dateIntervals = getDateIntervals(startDate, endDate, 5);
+    const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
     for (const {since, until} of dateIntervals) {
         const cacheKey = `${repoOwner}-${since}-${until}`;
         const cachedResult = PRS_CACHE.get<RestIssueAndPullRequest[]>(cacheKey);
@@ -189,7 +110,7 @@ async function fetchReviewsForPR(
     repoName: string,
     prNumber: number
 ): Promise<ReviewsForPullRequest> {
-    console.log("DEBUG:fetchReviewsForPR:", repoOwner, repoName, prNumber);
+    // console.log("DEBUG:fetchReviewsForPR:", repoOwner, repoName, prNumber);
     const allReviews: GraphQLReview[] = [];
     const allReviewThreads: GraphQLReviewThread[] = [];
     const cacheKey = `${repoOwner}-${repoName}-${prNumber}`;
@@ -306,91 +227,90 @@ async function fetchReviewsForPR(
 }
 
 // Function to aggregate metrics for a specific date range
-async function aggregateMetricsByDateRange(
+const aggregateMetricsByDateRange = async (
     repoOwner: string,
     startDate: Date,
     endDate: Date
-) {
-    const userMetrics: any = {};
+): Promise<Record<string, AggregateMetrics>> => {
+    const rawUserMetrics: Record<string, AggregateMetrics> = {};
     const commits = await fetchCommitsInDateRange(repoOwner, startDate, endDate);
     const pullRequests = await fetchPullRequestsInDateRange(
         repoOwner,
         startDate,
         endDate
     );
-    commits.forEach((commit) => {
-        if (!commit) {
-            return;
-        }
-        let author = "Unknown";
-        if (commit.authors?.nodes && commit.authors.nodes.length > 0) {
-            if (commit.authors.nodes[0].user && commit.authors.nodes[0].user.login)
-                author = commit.authors.nodes[0].user.login;
-        }
-        if (author === "Unknown" && commit.author) {
-            author = commit.author.name ?? "Unknown";
-        }
-        if (AUTHOR_ALIAS_MAP.has(author)) {
-            author = AUTHOR_ALIAS_MAP.get(author) || author;
-        }
-        if (BLACKLISTED_CODE_USERS.has(author)) {
-            return;
-        }
-        userMetrics[author] = userMetrics[author] || {
-            commits: 0,
+    const aggregatedCommits = aggregateCommits(commits);
+    console.log("DEBUG:aggregateMetricsByDateRange:", aggregatedCommits);
+    Object.entries(aggregatedCommits).forEach(([author, data]) => {
+        rawUserMetrics[author] = {
+            commits: data.additions + data.deletions,
             pullRequests: 0,
             reviews: 0,
             score: 0,
         };
-        const additions = commit.additions || 0;
-        const deletions = commit.deletions || 0;
-        userMetrics[author].commits += additions + deletions;
-
     });
 
     for (const pr of pullRequests) {
         const author = pr.user?.login || "Unknown";
-        if (BLACKLISTED_CODE_USERS.has(author)) {
-            continue;
-        }
         const repoName = `${pr.repository_url.split("/").pop()}`;
-        userMetrics[author] = userMetrics[author] || {
+        rawUserMetrics[author] = rawUserMetrics[author] || {
             commits: 0,
             pullRequests: 0,
             reviews: 0,
             score: 0,
         };
         // Increment the number of PRs raised
-        userMetrics[author].pullRequests += 1;
+        rawUserMetrics[author].pullRequests += 1;
         // Fetch reviews for the current PR
         const {reviews, reviewThreads} = await fetchReviewsForPR(repoOwner, repoName, pr.number);
         reviews.forEach((review) => {
             const reviewer = review.author?.login || "Unknown";
-            userMetrics[reviewer] = userMetrics[reviewer] || {
+            rawUserMetrics[reviewer] = rawUserMetrics[reviewer] || {
                 commits: 0,
                 pullRequests: 0,
                 reviews: 0,
                 score: 0,
             };
             // Increment the number of reviews by the user
-            userMetrics[reviewer].reviews += 1;
-
+            rawUserMetrics[reviewer].reviews += 1;
             // Add 1 point for the review
-            userMetrics[reviewer].score += 1;
+            rawUserMetrics[reviewer].score += 1;
 
             reviewThreads.forEach((reviewThread) => {
                 const threadAuthor = reviewThread?.comments?.edges[0]?.node?.author?.login ?? 'Unknown';
-                userMetrics[threadAuthor] = userMetrics[threadAuthor] || {
+                rawUserMetrics[threadAuthor] = rawUserMetrics[threadAuthor] || {
                     commits: 0,
                     pullRequests: 0,
                     reviews: 0,
                     score: 0,
                 };
-                userMetrics[threadAuthor].score += 0.1;
+                rawUserMetrics[threadAuthor].score += 0.1;
             })
         });
     }
-    return userMetrics;
+
+    const mergedUserMetrics: Record<string, AggregateMetrics> = {};
+    Object.entries(rawUserMetrics).forEach(([author, data]) => {
+        const normalizedAuthor = author.toLowerCase();
+        if (BLACKLISTED_CODE_USERS.has(author)) { // Ignore metrics for blacklisted users
+            return;
+        }
+        const aliasAuthor = AUTHOR_ALIAS_MAP.get(normalizedAuthor);
+        const realAuthor = aliasAuthor ?? normalizedAuthor;
+        const record = mergedUserMetrics[realAuthor] ?? {
+            commits: 0,
+            pullRequests: 0,
+            reviews: 0,
+            score: 0,
+        };
+        record.commits += data.commits;
+        record.pullRequests += data.pullRequests;
+        record.reviews += data.reviews;
+        record.score += data.score;
+        mergedUserMetrics[realAuthor] = record;
+    });
+    console.log("DEBUG:aggregateMetricsByDateRange:userMetrics:", mergedUserMetrics);
+    return mergedUserMetrics;
 }
 
 // Function to generate reports for multiple time PERIODS
@@ -399,6 +319,8 @@ export async function generateReport(
 ) {
     const workbook = xlsx.utils.book_new();
     const endDate = new Date();
+    // We need to start from yesterday
+    endDate.setDate(endDate.getDate() - 1);
     let rankedUsers: RankedUser[] = [];
 
     for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
@@ -408,7 +330,7 @@ export async function generateReport(
         const commitsData = Object.entries(report)
             .map((item: any) => {
                 return {
-                    author: item[0],
+                    author: String(item[0]).toLowerCase(),
                     commits: item[1].commits,
                 };
             })
@@ -416,7 +338,7 @@ export async function generateReport(
         const mergedPrsData = Object.entries(report)
             .map((item: any) => {
                 return {
-                    author: item[0],
+                    author: String(item[0]).toLowerCase(),
                     pullRequests: item[1].pullRequests,
                 };
             })
@@ -424,7 +346,7 @@ export async function generateReport(
         const prsReviewsData = Object.entries(report)
             .map((item: any) => {
                 return {
-                    author: item[0],
+                    author: String(item[0]).toLowerCase(),
                     score: item[1].score,
                 };
             })
@@ -492,9 +414,7 @@ async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: Ran
         users: [
             {email: 'alacret@insightt.io'},
             {email: 'ysouki@insightt.io'},
-            {email: 'jziebro@insightt.io'},
-            // {email: 'bhamilton@insightt.io'},
-            {email: 'aovalle@insightt.io'},
+            {email: 'bhamilton@insightt.io'},
             {email: 'lpena@insightt.io'}
         ],
         subject: "GitHub Metrics Report",

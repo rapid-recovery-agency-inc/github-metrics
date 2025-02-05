@@ -1,12 +1,11 @@
 // Helper function to break down date range into intervals to avoid hitting the 1000 search limit
 import {DateInterval} from "./types";
 
-const DAYS_IN_INTERVAL = 5;
 
 export function getDateIntervals(
     startDate: Date,
     endDate: Date,
-    intervalInDays = DAYS_IN_INTERVAL
+    intervalInDays: number,
 ): DateInterval[] {
     const intervals: DateInterval[] = [];
     let currentStartDate = new Date(startDate);
@@ -45,7 +44,7 @@ export function sleepInSeconds(seconds: number): Promise<void> {
 
 // Sleep function in milliseconds
 export async function sleep(milliseconds: number): Promise<void> {
-    console.log(`sleep:Sleeping for ${milliseconds/1000} seconds`);
+    console.log(`sleep:Sleeping for ${milliseconds / 1000} seconds`);
     if (milliseconds < 60000) {
         await new Promise((resolve) => setTimeout(resolve, milliseconds));
         return Promise.resolve();
