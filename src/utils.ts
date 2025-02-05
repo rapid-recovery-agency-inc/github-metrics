@@ -52,3 +52,19 @@ export async function sleep(milliseconds: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 60000));
     return sleep(milliseconds - 60000);
 }
+
+
+// Helper function to handle rate limits and retry after the reset time
+export async function handleRateLimit(response: any) {
+    if (response.headers["x-ratelimit-remaining"] === "0") {
+        const resetTimestamp =
+            parseInt(response.headers["x-ratelimit-reset"], 10) * 1000; // Convert to milliseconds
+        const resetTime = new Date(resetTimestamp);
+        const currentTime = new Date();
+
+        const waitTime = resetTime.getTime() - currentTime.getTime();
+
+        // Wait until the rate limit resets
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+    }
+}

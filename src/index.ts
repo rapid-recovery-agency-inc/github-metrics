@@ -2,7 +2,7 @@ import {Octokit} from "octokit";
 import dotenv from "dotenv";
 import xlsx from "xlsx";
 import fetch from 'node-fetch';
-import {getDateIntervals} from "./utils.js";
+import {getDateIntervals, handleRateLimit} from "./utils.js";
 import {
     AggregateMetrics,
     GraphQLReview,
@@ -16,6 +16,8 @@ import {sendTemplateEmail} from "./email.js";
 import {PRS_CACHE, PRS_REVIEW_CACHE} from "./cache.js";
 import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API} from "./constants";
 import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
+import {debugToFile} from "./debug";
+import {fetchRepositories} from "./repositories";
 
 
 dotenv.config();
@@ -41,21 +43,6 @@ const PERIODS: Record<number, string> = {
 
 const MAX_RETRIES = 3;
 
-
-// Helper function to handle rate limits and retry after the reset time
-async function handleRateLimit(response: any) {
-    if (response.headers["x-ratelimit-remaining"] === "0") {
-        const resetTimestamp =
-            parseInt(response.headers["x-ratelimit-reset"], 10) * 1000; // Convert to milliseconds
-        const resetTime = new Date(resetTimestamp);
-        const currentTime = new Date();
-
-        const waitTime = resetTime.getTime() - currentTime.getTime();
-
-        // Wait until the rate limit resets
-        await new Promise((resolve) => setTimeout(resolve, waitTime));
-    }
-}
 
 // Function to fetch all commits within a given date range using date intervals
 
@@ -229,18 +216,19 @@ async function fetchReviewsForPR(
 // Function to aggregate metrics for a specific date range
 const aggregateMetricsByDateRange = async (
     repoOwner: string,
+    repositories: string[],
     startDate: Date,
     endDate: Date
 ): Promise<Record<string, AggregateMetrics>> => {
     const rawUserMetrics: Record<string, AggregateMetrics> = {};
-    const commits = await fetchCommitsInDateRange(repoOwner, startDate, endDate);
+    const commits = await fetchCommitsInDateRange(repoOwner, repositories, startDate, endDate);
+    debugToFile(JSON.stringify(commits, null, 2));
     const pullRequests = await fetchPullRequestsInDateRange(
         repoOwner,
         startDate,
         endDate
     );
     const aggregatedCommits = aggregateCommits(commits);
-    console.log("DEBUG:aggregateMetricsByDateRange:", aggregatedCommits);
     Object.entries(aggregatedCommits).forEach(([author, data]) => {
         rawUserMetrics[author] = {
             commits: data.additions + data.deletions,
@@ -309,14 +297,42 @@ const aggregateMetricsByDateRange = async (
         record.score += data.score;
         mergedUserMetrics[realAuthor] = record;
     });
-    console.log("DEBUG:aggregateMetricsByDateRange:userMetrics:", mergedUserMetrics);
     return mergedUserMetrics;
 }
+
+// Function to send an email with the report attached
+async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: RankedUser[]) {
+    const rankedListString = aggregateRanking.map((rank, index) => {
+        return `${index + 1}.  ${rank.user} <br/>`;
+    }).join('\n');
+    await sendTemplateEmail({
+        users: [
+            {email: 'alacret@insightt.io'},
+            {email: 'ysouki@insightt.io'},
+            {email: 'bhamilton@insightt.io'},
+            {email: 'lpena@insightt.io'}
+        ],
+        subject: "GitHub Metrics Report",
+        body: `${rankedListString}`,
+        attachments: [
+            {
+                filename: FILE_PATH,
+                path: FILE_PATH,
+            }
+        ]
+
+    });
+    console.log(`Email sent:`);
+}
+
 
 // Function to generate reports for multiple time PERIODS
 export async function generateReport(
     repoOwner: string,
 ) {
+    const repositories = await fetchRepositories(repoOwner);
+    console.log("DEBUG:generateReport:repositories:", repositories);
+
     const workbook = xlsx.utils.book_new();
     const endDate = new Date();
     // We need to start from yesterday
@@ -326,7 +342,7 @@ export async function generateReport(
     for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
         const startDate = new Date();
         startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
-        const report = await aggregateMetricsByDateRange(repoOwner, startDate, endDate);
+        const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
         const commitsData = Object.entries(report)
             .map((item: any) => {
                 return {
@@ -405,30 +421,6 @@ export async function generateReport(
     await sendEmailWithAttachment(attachment, rankedUsers);
 }
 
-// Function to send an email with the report attached
-async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: RankedUser[]) {
-    const rankedListString = aggregateRanking.map((rank, index) => {
-        return `${index + 1}.  ${rank.user} <br/>`;
-    }).join('\n');
-    await sendTemplateEmail({
-        users: [
-            {email: 'alacret@insightt.io'},
-            {email: 'ysouki@insightt.io'},
-            {email: 'bhamilton@insightt.io'},
-            {email: 'lpena@insightt.io'}
-        ],
-        subject: "GitHub Metrics Report",
-        body: `${rankedListString}`,
-        attachments: [
-            {
-                filename: FILE_PATH,
-                path: FILE_PATH,
-            }
-        ]
-
-    });
-    console.log(`Email sent:`);
-}
 
 
 

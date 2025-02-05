@@ -30,7 +30,8 @@ interface PageInfo  {
 
 export interface GraphQLRepositoryNode {
     node: {
-        defaultBranchRef: {
+        name?: string;
+        defaultBranchRef?: {
             target: {
                 history: {
                     pageInfo: PageInfo
@@ -43,11 +44,30 @@ export interface GraphQLRepositoryNode {
     }
 }
 
-export interface GraphQLCommitResponse {
+export interface GraphQLCommitsResponse {
+    data: {
+        repository: {
+            defaultBranchRef: {
+                target: {
+                    history: {
+                        edges: {
+                            node: GraphQLCommit
+                        }[]
+                        pageInfo: PageInfo;
+                    }
+                }
+            };
+        }
+    }
+    errors: any[];
+}
+
+export interface GraphQLRepositoriesResponse {
     data: {
         repositoryOwner: {
             repositories: {
                 edges: GraphQLRepositoryNode[]
+                pageInfo: PageInfo;
             };
         }
     }
