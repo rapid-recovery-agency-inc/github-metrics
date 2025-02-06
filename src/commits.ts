@@ -1,8 +1,8 @@
 import {AggregateCommits, GraphQLCommit, GraphQLCommitsResponse} from "./types";
-import {getDateIntervals, sleep} from "./utils";
+import {sleep} from "./utils";
 import {COMMITS_CACHE} from "./cache";
 import fetch from "node-fetch";
-import {DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API} from "./constants";
+import { GITHUB_GRAPHQL_API} from "./constants";
 
 const COMMITS_QUERY = `
     query($repoOwner: String!, $repository:String!, $since: GitTimestamp, $until: GitTimestamp, $cursor: String) {
@@ -50,6 +50,7 @@ const fetchCommits = async (
     since: string,
     until: string,
 ): Promise<GraphQLCommit[]> => {
+    console.log("DEBUG:fetchCommits:", repoOwner, repository, since, until);
     const allCommits: GraphQLCommit[] = [];
     const cacheKey = `${repoOwner}-${repository}-${since}-${until}`;
     const cachedResult = COMMITS_CACHE.get<GraphQLCommit[]>(cacheKey);
@@ -100,11 +101,6 @@ const fetchCommits = async (
             if (!result.data.repository.defaultBranchRef) {
                 return [];
             }
-            console.log("DEBUG:fetchCommits:response:", result);
-            console.log("DEBUG:fetchCommits:response:", result.data);
-            console.log("DEBUG:fetchCommits:response:", result.data.repository);
-            console.log("DEBUG:fetchCommits:response:", result.data.repository.defaultBranchRef);
-            console.log("DEBUG:fetchCommits:response:", result.data.repository.defaultBranchRef.target);
             const {edges, pageInfo} = result.data.repository.defaultBranchRef.target.history;
             for (const commit of edges) {
                 allCommits.push(commit.node);
@@ -125,14 +121,9 @@ export const fetchCommitsInDateRange = async (
 ): Promise<GraphQLCommit[]> => {
     console.log("DEBUG:fetchCommitsInDateRange:", repoOwner, repositories, startDate, endDate);
     const allCommits: GraphQLCommit[] = [];
-    const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
-    console.log("DEBUG:fetchCommitsInDateRange:dateIntervals:", dateIntervals);
-
     for (const repository of repositories) {
-        for (const {since, until} of dateIntervals) {
-            const commits = await fetchCommits(repoOwner, repository, since, until);
-            allCommits.push(...commits);
-        }
+        const commits = await fetchCommits(repoOwner, repository, startDate.toISOString(), endDate.toISOString());
+        allCommits.push(...commits);
     }
     const deduplicatedCommitsMap = new Map<string, GraphQLCommit>();
     allCommits.forEach((commit) => {

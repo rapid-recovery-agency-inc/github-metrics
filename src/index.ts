@@ -97,7 +97,7 @@ async function fetchReviewsForPR(
     repoName: string,
     prNumber: number
 ): Promise<ReviewsForPullRequest> {
-    // console.log("DEBUG:fetchReviewsForPR:", repoOwner, repoName, prNumber);
+    console.log("DEBUG:fetchReviewsForPR:", repoOwner, repoName, prNumber);
     const allReviews: GraphQLReview[] = [];
     const allReviewThreads: GraphQLReviewThread[] = [];
     const cacheKey = `${repoOwner}-${repoName}-${prNumber}`;
@@ -222,7 +222,6 @@ const aggregateMetricsByDateRange = async (
 ): Promise<Record<string, AggregateMetrics>> => {
     const rawUserMetrics: Record<string, AggregateMetrics> = {};
     const commits = await fetchCommitsInDateRange(repoOwner, repositories, startDate, endDate);
-    debugToFile(JSON.stringify(commits, null, 2));
     const pullRequests = await fetchPullRequestsInDateRange(
         repoOwner,
         startDate,
@@ -237,7 +236,8 @@ const aggregateMetricsByDateRange = async (
             score: 0,
         };
     });
-
+    console.log("DEBUG:aggregatedCommits:", aggregatedCommits);
+    console.log("DEBUG:rawUserMetrics:", rawUserMetrics);
     for (const pr of pullRequests) {
         const author = pr.user?.login || "Unknown";
         const repoName = `${pr.repository_url.split("/").pop()}`;
@@ -276,7 +276,7 @@ const aggregateMetricsByDateRange = async (
             })
         });
     }
-
+    console.log("DEBUG:rawUserMetrics:", rawUserMetrics);
     const mergedUserMetrics: Record<string, AggregateMetrics> = {};
     Object.entries(rawUserMetrics).forEach(([author, data]) => {
         const normalizedAuthor = author.toLowerCase();
@@ -297,6 +297,7 @@ const aggregateMetricsByDateRange = async (
         record.score += data.score;
         mergedUserMetrics[realAuthor] = record;
     });
+    console.log("DEBUG:mergedUserMetrics:", mergedUserMetrics);
     return mergedUserMetrics;
 }
 
@@ -331,8 +332,7 @@ export async function generateReport(
     repoOwner: string,
 ) {
     const repositories = await fetchRepositories(repoOwner);
-    console.log("DEBUG:generateReport:repositories:", repositories);
-
+    //
     const workbook = xlsx.utils.book_new();
     const endDate = new Date();
     // We need to start from yesterday
@@ -367,7 +367,9 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.score - a.score);
-
+        console.log("DEBUG:commitsData:", commitsData);
+        console.log("DEBUG:mergedPrsData:", mergedPrsData);
+        console.log("DEBUG:prsReviewsData:", prsReviewsData);
         //Create a function to calculate the aggregate ranking
         const aggregateRanking = (): RankedUser[] => {
             const rankingMap: { [key: string]: number } = {};
@@ -393,17 +395,18 @@ export async function generateReport(
 
         const sheetData: any[] = [];
         sheetData.push(["Commit's Users", "Changes: additions + deletions", "Merged PRS", "No of Merged PRS", "PRS Reviews", "No of PRS Reviews"]);
-        Object.entries(report).forEach(([user, data]: [string, any], index) => {
+        const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length);
+        for(let i = 0; i < maxRows; i++) {
             sheetData.push([
-                `${index + 1}.  ${commitsData[index].author}`,
-                `${commitsData[index].commits}`,
-                `${index + 1}.  ${mergedPrsData[index].author}`,
-                `${mergedPrsData[index].pullRequests}`,
-                `${index + 1}.  ${prsReviewsData[index].author}`,
-                `${parseFloat(prsReviewsData[index].score.toFixed(1))}`
-
+                i < commitsData.length ? `${i + 1}.  ${commitsData[i].author}` : "",
+                i < commitsData.length ? `${commitsData[i].commits}` : "",
+                i < mergedPrsData.length ? `${i + 1}.  ${mergedPrsData[i].author}` : "",
+                i < mergedPrsData.length ? `${mergedPrsData[i].pullRequests}` : "",
+                i < prsReviewsData.length ? `${i + 1}.  ${prsReviewsData[i].author}` : "",
+                i < prsReviewsData.length ? `${parseFloat(prsReviewsData[i].score.toFixed(1))}` : "",
             ]);
-        });
+        }
+
         const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
         worksheet['!cols'] = [
             {wch: 20},
