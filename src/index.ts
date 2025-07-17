@@ -89,6 +89,7 @@ async function fetchPullRequestsInDateRange(
             }
         }
     }
+    console.log("DEBUG:allPullRequests:", JSON.stringify(allPullRequests, null, 1));
     return allPullRequests;
 }
 
@@ -310,7 +311,7 @@ async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: Ran
         users: [
             {email: 'alacret@insightt.io'},
             {email: 'ysouki@insightt.io'},
-            {email: 'bhamilton@insightt.io'},
+            // {email: 'bhamilton@insightt.io'},
             {email: 'lpena@insightt.io'}
         ],
         subject: "GitHub Metrics Report",
