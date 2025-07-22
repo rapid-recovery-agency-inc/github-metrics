@@ -97,6 +97,7 @@ export interface GraphQLReview {
     author?:{
         login: string;
     }
+    state: string;
 }
 
 export interface GraphQLReviewNode {
@@ -133,6 +134,7 @@ export interface AggregateMetrics {
     commits: number;
     pullRequests: number;
     reviews: number;
+    rejections: number;
     score: number;
     bugLabels: number;
     enhancementLabels: number;

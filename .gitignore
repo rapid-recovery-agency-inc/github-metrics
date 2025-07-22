@@ -9,6 +9,7 @@ dist/*
 !.elasticbeanstalk/*.global.yml
 .env.aws.main
 .idea/
+GitHub_Labels_Report.xlsx
 GitHub_Metrics_Report.xlsx
 disk-cache/
 .env

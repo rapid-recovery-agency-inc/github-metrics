@@ -420,6 +420,7 @@ const aggregateMetricsByDateRange = async (
             commits: data.additions + data.deletions,
             pullRequests: 0,
             reviews: 0,
+            rejections: 0,
             score: 0,
             bugLabels: 0,
             enhancementLabels: 0,
@@ -435,6 +436,7 @@ const aggregateMetricsByDateRange = async (
             commits: 0,
             pullRequests: 0,
             reviews: 0,
+            rejections: 0,
             score: 0,
             bugLabels: 0,
             enhancementLabels: 0,
@@ -450,6 +452,7 @@ const aggregateMetricsByDateRange = async (
                 commits: 0,
                 pullRequests: 0,
                 reviews: 0,
+                rejections: 0,
                 score: 0,
                 bugLabels: 0,
                 enhancementLabels: 0,
@@ -457,6 +460,12 @@ const aggregateMetricsByDateRange = async (
             };
             // Increment the number of reviews by the user
             rawUserMetrics[reviewer].reviews += 1;
+            
+            // Check if this review is a rejection (CHANGES_REQUESTED)
+            if (review.state === 'CHANGES_REQUESTED') {
+                rawUserMetrics[reviewer].rejections += 1;
+            }
+            
             // Add 1 point for the review
             rawUserMetrics[reviewer].score += 1;
 
@@ -466,6 +475,7 @@ const aggregateMetricsByDateRange = async (
                     commits: 0,
                     pullRequests: 0,
                     reviews: 0,
+                    rejections: 0,
                     score: 0,
                     bugLabels: 0,
                     enhancementLabels: 0,
@@ -488,6 +498,7 @@ const aggregateMetricsByDateRange = async (
             commits: 0,
             pullRequests: 0,
             reviews: 0,
+            rejections: 0,
             score: 0,
             bugLabels: 0,
             enhancementLabels: 0,
@@ -496,6 +507,7 @@ const aggregateMetricsByDateRange = async (
         record.commits += data.commits;
         record.pullRequests += data.pullRequests;
         record.reviews += data.reviews;
+        record.rejections += data.rejections;
         record.score += data.score;
         record.bugLabels += data.bugLabels;
         record.enhancementLabels += data.enhancementLabels;
@@ -751,9 +763,18 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.score - a.score);
+        const prsRejectionsData = Object.entries(report)
+            .map((item: any) => {
+                return {
+                    author: String(item[0]).toLowerCase(),
+                    rejections: item[1].rejections,
+                };
+            })
+            .sort((a, b) => b.rejections - a.rejections);
         console.log("DEBUG:commitsData:", commitsData);
         console.log("DEBUG:mergedPrsData:", mergedPrsData);
         console.log("DEBUG:prsReviewsData:", prsReviewsData);
+        console.log("DEBUG:prsRejectionsData:", prsRejectionsData);
         //Create a function to calculate the aggregate ranking
         const aggregateRanking = (): RankedUser[] => {
             const rankingMap: { [key: string]: number } = {};
@@ -769,6 +790,7 @@ export async function generateReport(
             sumIndexes(commitsData);
             sumIndexes(mergedPrsData);
             sumIndexes(prsReviewsData);
+            sumIndexes(prsRejectionsData);
 
             return Object.entries(rankingMap)
                 .map(([user, totalIndex]) => ({user, totalIndex}))
@@ -781,10 +803,11 @@ export async function generateReport(
         sheetData.push([
             "Commit's Users", "Changes: additions + deletions", 
             "Merged PRS", "No of Merged PRS", 
-            "PRS Reviews", "No of PRS Reviews"
+            "PRS Reviews", "No of PRS Reviews",
+            "Prs Rejected", "Nr of Prs Rejected"
         ]);
         
-        const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length);
+        const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length, prsRejectionsData.length);
         for(let i = 0; i < maxRows; i++) {
             sheetData.push([
                 i < commitsData.length ? `${i + 1}.  ${commitsData[i].author}` : "",
@@ -793,6 +816,8 @@ export async function generateReport(
                 i < mergedPrsData.length ? `${mergedPrsData[i].pullRequests}` : "",
                 i < prsReviewsData.length ? `${i + 1}.  ${prsReviewsData[i].author}` : "",
                 i < prsReviewsData.length ? `${parseFloat(prsReviewsData[i].score.toFixed(1))}` : "",
+                i < prsRejectionsData.length ? `${i + 1}.  ${prsRejectionsData[i].author}` : "",
+                i < prsRejectionsData.length ? `${prsRejectionsData[i].rejections}` : "",
             ]);
         }
 
@@ -804,6 +829,8 @@ export async function generateReport(
             {wch: 12}, // No of Merged PRS
             {wch: 20}, // PRS Reviews
             {wch: 12}, // No of PRS Reviews
+            {wch: 20}, // Prs Rejected
+            {wch: 15}, // Nr of Prs Rejected
         ];
         xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
     }
