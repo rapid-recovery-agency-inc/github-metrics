@@ -31,3 +31,5 @@ class DiskCache {
 export const COMMITS_CACHE: DiskCache = new DiskCache(path.join('disk-cache', 'commits.json'));
 export const PRS_CACHE: DiskCache = new DiskCache(path.join('disk-cache', 'prs.json'));
 export const PRS_REVIEW_CACHE: DiskCache = new DiskCache(path.join('disk-cache', 'prs-reviews.json'));
+export const ISSUES_CACHE: DiskCache = new DiskCache(path.join('disk-cache', 'issues.json'));
+export const ISSUE_EVENTS_CACHE: DiskCache = new DiskCache(path.join('disk-cache', 'issue-events.json'));

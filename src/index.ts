@@ -10,10 +10,13 @@ import {
     GraphQLReviewThread,
     GraphQLReviewThreadNode,
     RestIssueAndPullRequest,
+    RestIssue,
+    IssueEvent,
+    LabelMetrics,
     ReviewsForPullRequest
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
-import {PRS_CACHE, PRS_REVIEW_CACHE} from "./cache.js";
+import {PRS_CACHE, PRS_REVIEW_CACHE, ISSUES_CACHE, ISSUE_EVENTS_CACHE} from "./cache.js";
 import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API} from "./constants";
 import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
 import {debugToFile} from "./debug";
@@ -27,7 +30,14 @@ interface RankedUser {
     totalIndex: number;
 }
 
+interface LabelFrequency {
+    labelName: string;
+    frequency: number;
+    repositories: string[];
+}
+
 const FILE_PATH = "GitHub_Metrics_Report.xlsx";
+const LABELS_FILE_PATH = "GitHub_Labels_Report.xlsx";
 // Initialize Octokit instance with GitHub token
 const octokit = new Octokit({
     auth: process.env.GITHUB_TOKEN,
@@ -214,6 +224,181 @@ async function fetchReviewsForPR(
     return {reviews: allReviews, reviewThreads: allReviewThreads};
 }
 
+// Function to categorize labels
+function categorizeLabel(labelName: string): 'bug' | 'enhancement' | 'other' {
+    const lowerCaseName = labelName.toLowerCase();
+    if (lowerCaseName.includes('bug') || lowerCaseName.includes('fix') || lowerCaseName.includes('error')) {
+        return 'bug';
+    }
+    if (lowerCaseName.includes('enhancement') || lowerCaseName.includes('feature') || 
+        lowerCaseName.includes('improvement') || lowerCaseName.includes('enhancement')) {
+        return 'enhancement';
+    }
+    return 'other';
+}
+
+// Function to fetch all issues within a given date range
+async function fetchIssuesInDateRange(
+    repoOwner: string,
+    startDate: Date,
+    endDate: Date
+): Promise<RestIssue[]> {
+    console.log("DEBUG:fetchIssuesInDateRange:", repoOwner, startDate, endDate);
+    const allIssues: RestIssue[] = [];
+    const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
+    
+    for (const {since, until} of dateIntervals) {
+        const cacheKey = `${repoOwner}-issues-${since}-${until}`;
+        const cachedResult = ISSUES_CACHE.get<RestIssue[]>(cacheKey);
+        if (cachedResult) {
+            allIssues.push(...cachedResult);
+            continue;
+        }
+        
+        let page = 1;
+        let hasMore = true;
+        const intervalIssues: RestIssue[] = [];
+        
+        while (hasMore) {
+            try {
+                const response = await octokit.rest.search.issuesAndPullRequests({
+                    q: `org:${repoOwner} type:issue created:${since}..${until}`,
+                    per_page: 100,
+                    page,
+                });
+                
+                await handleRateLimit(response);
+                intervalIssues.push(...response.data.items.filter((item: any) => !item.pull_request) as RestIssue[]);
+                
+                hasMore = response.data.items.length === 100;
+                page += 1;
+            } catch (error: any) {
+                if (error.status === 403) {
+                    await handleRateLimit(error.response);
+                } else {
+                    throw error;
+                }
+            }
+        }
+        
+        ISSUES_CACHE.set(cacheKey, intervalIssues);
+        allIssues.push(...intervalIssues);
+    }
+    
+    return allIssues;
+}
+
+// Function to fetch label events for an issue
+async function fetchLabelEventsForIssue(
+    repoOwner: string,
+    repoName: string,
+    issueNumber: number,
+    startDate: Date,
+    endDate: Date
+): Promise<IssueEvent[]> {
+    console.log("DEBUG:fetchLabelEventsForIssue:", repoOwner, repoName, issueNumber);
+    const cacheKey = `${repoOwner}-${repoName}-issue-${issueNumber}-events`;
+    const cachedResult = ISSUE_EVENTS_CACHE.get<IssueEvent[]>(cacheKey);
+    if (cachedResult) {
+        return cachedResult.filter(event => {
+            const eventDate = new Date(event.created_at);
+            return eventDate >= startDate && eventDate <= endDate;
+        });
+    }
+    
+    try {
+        const response = await octokit.rest.issues.listEvents({
+            owner: repoOwner,
+            repo: repoName,
+            issue_number: issueNumber,
+            per_page: 100,
+        });
+        
+        await handleRateLimit(response);
+        
+        const labelEvents = response.data.filter((event: any) => event.event === 'labeled') as IssueEvent[];
+        ISSUE_EVENTS_CACHE.set(cacheKey, labelEvents);
+        
+        return labelEvents.filter(event => {
+            const eventDate = new Date(event.created_at);
+            return eventDate >= startDate && eventDate <= endDate;
+        });
+    } catch (error: any) {
+        console.error(`Error fetching label events for issue ${issueNumber}:`, error);
+        return [];
+    }
+}
+
+// Function to aggregate label metrics by repository
+async function aggregateLabelMetricsByRepo(
+    repoOwner: string,
+    repositories: string[],
+    startDate: Date,
+    endDate: Date
+): Promise<Record<string, LabelMetrics>> {
+    console.log("DEBUG:aggregateLabelMetricsByRepo:", repoOwner, startDate, endDate);
+    const repoLabelMetrics: Record<string, LabelMetrics> = {};
+    
+    const issues = await fetchIssuesInDateRange(repoOwner, startDate, endDate);
+    
+    for (const issue of issues) {
+        const repoName = issue.repository_url.split("/").pop() || "unknown";
+        
+        if (!repoLabelMetrics[repoName]) {
+            repoLabelMetrics[repoName] = {
+                bugLabels: 0,
+                enhancementLabels: 0,
+                otherLabels: 0,
+            };
+        }
+        
+        // Get label events for this issue in the date range
+        const labelEvents = await fetchLabelEventsForIssue(repoOwner, repoName, issue.number, startDate, endDate);
+        
+        for (const event of labelEvents) {
+            if (event.label) {
+                const category = categorizeLabel(event.label.name);
+                switch (category) {
+                    case 'bug':
+                        repoLabelMetrics[repoName].bugLabels += 1;
+                        break;
+                    case 'enhancement':
+                        repoLabelMetrics[repoName].enhancementLabels += 1;
+                        break;
+                    case 'other':
+                        repoLabelMetrics[repoName].otherLabels += 1;
+                        break;
+                }
+            }
+        }
+    }
+    
+    return repoLabelMetrics;
+}
+
+// Function to count issues created by repository
+async function getIssuesCreatedByRepo(
+    repoOwner: string,
+    repositories: string[],
+    startDate: Date,
+    endDate: Date
+): Promise<Record<string, number>> {
+    console.log("DEBUG:getIssuesCreatedByRepo:", repoOwner, startDate, endDate);
+    const repoIssueCount: Record<string, number> = {};
+    
+    const issues = await fetchIssuesInDateRange(repoOwner, startDate, endDate);
+    
+    for (const issue of issues) {
+        const repoName = issue.repository_url.split("/").pop() || "unknown";
+        if (!repoIssueCount[repoName]) {
+            repoIssueCount[repoName] = 0;
+        }
+        repoIssueCount[repoName] += 1;
+    }
+    
+    return repoIssueCount;
+}
+
 // Function to aggregate metrics for a specific date range
 const aggregateMetricsByDateRange = async (
     repoOwner: string,
@@ -228,6 +413,7 @@ const aggregateMetricsByDateRange = async (
         startDate,
         endDate
     );
+    const repoLabelMetrics = await aggregateLabelMetricsByRepo(repoOwner, repositories, startDate, endDate);
     const aggregatedCommits = aggregateCommits(commits);
     Object.entries(aggregatedCommits).forEach(([author, data]) => {
         rawUserMetrics[author] = {
@@ -235,6 +421,9 @@ const aggregateMetricsByDateRange = async (
             pullRequests: 0,
             reviews: 0,
             score: 0,
+            bugLabels: 0,
+            enhancementLabels: 0,
+            otherLabels: 0,
         };
     });
     console.log("DEBUG:aggregatedCommits:", aggregatedCommits);
@@ -247,6 +436,9 @@ const aggregateMetricsByDateRange = async (
             pullRequests: 0,
             reviews: 0,
             score: 0,
+            bugLabels: 0,
+            enhancementLabels: 0,
+            otherLabels: 0,
         };
         // Increment the number of PRs raised
         rawUserMetrics[author].pullRequests += 1;
@@ -259,6 +451,9 @@ const aggregateMetricsByDateRange = async (
                 pullRequests: 0,
                 reviews: 0,
                 score: 0,
+                bugLabels: 0,
+                enhancementLabels: 0,
+                otherLabels: 0,
             };
             // Increment the number of reviews by the user
             rawUserMetrics[reviewer].reviews += 1;
@@ -272,6 +467,9 @@ const aggregateMetricsByDateRange = async (
                     pullRequests: 0,
                     reviews: 0,
                     score: 0,
+                    bugLabels: 0,
+                    enhancementLabels: 0,
+                    otherLabels: 0,
                 };
                 rawUserMetrics[threadAuthor].score += 0.1;
             })
@@ -291,40 +489,225 @@ const aggregateMetricsByDateRange = async (
             pullRequests: 0,
             reviews: 0,
             score: 0,
+            bugLabels: 0,
+            enhancementLabels: 0,
+            otherLabels: 0,
         };
         record.commits += data.commits;
         record.pullRequests += data.pullRequests;
         record.reviews += data.reviews;
         record.score += data.score;
+        record.bugLabels += data.bugLabels;
+        record.enhancementLabels += data.enhancementLabels;
+        record.otherLabels += data.otherLabels;
         mergedUserMetrics[realAuthor] = record;
     });
     console.log("DEBUG:mergedUserMetrics:", mergedUserMetrics);
     return mergedUserMetrics;
 }
 
-// Function to send an email with the report attached
-async function sendEmailWithAttachment(attachment: Buffer, aggregateRanking: RankedUser[]) {
+// Function to send an email with the reports attached
+async function sendEmailWithAttachments(attachment: Buffer, aggregateRanking: RankedUser[], labelsReportPath?: string) {
     const rankedListString = aggregateRanking.map((rank, index) => {
         return `${index + 1}.  ${rank.user} <br/>`;
     }).join('\n');
+    
+    const attachments = [
+        {
+            filename: FILE_PATH,
+            path: FILE_PATH,
+        }
+    ];
+    
+    // Add labels report if it exists
+    if (labelsReportPath) {
+        attachments.push({
+            filename: LABELS_FILE_PATH,
+            path: labelsReportPath,
+        });
+    }
+    
     await sendTemplateEmail({
         users: [
-            {email: 'alacret@insightt.io'},
-            {email: 'ysouki@insightt.io'},
-            {email: 'ezabala@insightt.io'},
-            {email: 'lpena@insightt.io'}
+            {email: 'estebanpersonal20@gmail.com'},
+            // {email: 'alacret@insightt.io'},
+            // {email: 'ysouki@insightt.io'},
+            // {email: 'ezabala@insightt.io'},
+            // {email: 'lpena@insightt.io'}
         ],
         subject: "GitHub Metrics Report",
-        body: `${rankedListString}`,
-        attachments: [
-            {
-                filename: FILE_PATH,
-                path: FILE_PATH,
-            }
-        ]
+        body: `${rankedListString}<br/><br/>Note: Labels report is included as a separate attachment.`,
+        attachments: attachments
 
     });
-    console.log(`Email sent:`);
+    console.log(`Email sent with ${attachments.length} attachments`);
+}
+
+// Function to get all label counts by repository
+async function getDetailedLabelMetricsByRepo(
+    repoOwner: string,
+    repositories: string[],
+    startDate: Date,
+    endDate: Date
+): Promise<{
+    repoMetrics: Record<string, Record<string, number>>;
+    otherLabels: string[];
+    issuesCreatedByRepo: Record<string, number>;
+}> {
+    console.log("🔍 DEBUG:getDetailedLabelMetricsByRepo:", repoOwner, startDate.toISOString().split('T')[0], endDate.toISOString().split('T')[0]);
+    const repoLabelMetrics: Record<string, Record<string, number>> = {};
+    const allOtherLabels = new Set<string>();
+    const issuesCreatedByRepo: Record<string, number> = {};
+    
+    console.log("📥 Fetching issues in date range...");
+    const issues = await fetchIssuesInDateRange(repoOwner, startDate, endDate);
+    console.log(`📋 Found ${issues.length} issues to process`);
+    
+    for (let i = 0; i < issues.length; i++) {
+        const issue = issues[i];
+        const repoName = issue.repository_url.split("/").pop() || "unknown";
+        
+        // Count issues created
+        if (!issuesCreatedByRepo[repoName]) {
+            issuesCreatedByRepo[repoName] = 0;
+        }
+        issuesCreatedByRepo[repoName] += 1;
+        
+        if (!repoLabelMetrics[repoName]) {
+            repoLabelMetrics[repoName] = {
+                'Bug label': 0,
+                'Enhancement label': 0,
+            };
+        }
+        
+        // Show progress every 10 issues
+        if (i % 10 === 0) {
+            console.log(`📊 Processing issue ${i + 1}/${issues.length}: #${issue.number} in ${repoName}`);
+        }
+        
+        // Get label events for this issue in the date range
+        const labelEvents = await fetchLabelEventsForIssue(repoOwner, repoName, issue.number, startDate, endDate);
+        
+        // Process label events
+        for (const event of labelEvents) {
+            if (event.label) {
+                const labelName = event.label.name;
+                const category = categorizeLabel(labelName);
+                
+                if (category === 'bug') {
+                    repoLabelMetrics[repoName]['Bug label'] += 1;
+                } else if (category === 'enhancement') {
+                    repoLabelMetrics[repoName]['Enhancement label'] += 1;
+                } else {
+                    // This is an "other" label - track it individually
+                    allOtherLabels.add(labelName);
+                    if (!repoLabelMetrics[repoName][labelName]) {
+                        repoLabelMetrics[repoName][labelName] = 0;
+                    }
+                    repoLabelMetrics[repoName][labelName] += 1;
+                }
+            }
+        }
+        
+        // Also process current labels on the issue
+        if (issue.labels && issue.labels.length > 0) {
+            for (const label of issue.labels) {
+                const labelName = label.name;
+                const category = categorizeLabel(labelName);
+                
+                if (category === 'bug') {
+                    repoLabelMetrics[repoName]['Bug label'] += 1;
+                } else if (category === 'enhancement') {
+                    repoLabelMetrics[repoName]['Enhancement label'] += 1;
+                } else {
+                    // This is an "other" label - track it individually
+                    allOtherLabels.add(labelName);
+                    if (!repoLabelMetrics[repoName][labelName]) {
+                        repoLabelMetrics[repoName][labelName] = 0;
+                    }
+                    repoLabelMetrics[repoName][labelName] += 1;
+                }
+            }
+        }
+    }
+    
+    return {
+        repoMetrics: repoLabelMetrics,
+        otherLabels: Array.from(allOtherLabels).sort(),
+        issuesCreatedByRepo
+    };
+}
+
+// Function to generate a comprehensive labels report
+async function generateLabelsReport(repoOwner: string) {
+    console.log("🏷️  Generating comprehensive labels report...");
+    const repositories = await fetchRepositories(repoOwner);
+    console.log(`📚 Found ${repositories.length} repositories`);
+    const workbook = xlsx.utils.book_new();
+    const endDate = new Date();
+    endDate.setDate(endDate.getDate() - 1);
+
+    for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
+        const startDate = new Date();
+        startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
+        console.log(`📅 Processing labels for period: ${periodName} (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
+        
+        const { repoMetrics, otherLabels, issuesCreatedByRepo } = await getDetailedLabelMetricsByRepo(repoOwner, repositories, startDate, endDate);
+        console.log(`🏷️  Found ${otherLabels.length} unique other labels for ${periodName}`);
+        
+        // Create header row: Repo | Issues created | Bug label | Enhancement label | otherLabel1 | otherLabel2 | ...
+        const headerRow = [
+            "Repo",
+            "Issues created", 
+            "Bug label", 
+            "Enhancement label",
+            ...otherLabels
+        ];
+        
+        const sheetData: any[] = [headerRow];
+        
+        // Create rows for each repository
+        Object.keys(repoMetrics).forEach(repoName => {
+            const row = [
+                repoName,
+                issuesCreatedByRepo[repoName] || 0,
+                repoMetrics[repoName]['Bug label'] || 0,
+                repoMetrics[repoName]['Enhancement label'] || 0
+            ];
+            
+            // Add counts for each "other" label
+            otherLabels.forEach(labelName => {
+                row.push(repoMetrics[repoName][labelName] || 0);
+            });
+            
+            sheetData.push(row);
+        });
+
+        const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
+        
+        // Set column widths
+        const columnWidths = [
+            {wch: 25}, // Repo
+            {wch: 15}, // Issues created
+            {wch: 12}, // Bug label
+            {wch: 18}, // Enhancement label
+        ];
+        
+        // Add widths for other label columns
+        otherLabels.forEach(() => {
+            columnWidths.push({wch: 15});
+        });
+        
+        worksheet['!cols'] = columnWidths;
+        
+        xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
+    }
+
+    // Save the labels report
+    xlsx.writeFile(workbook, LABELS_FILE_PATH, {bookType: "xlsx"});
+    console.log(`Labels report saved to ${LABELS_FILE_PATH}`);
+    
+    return LABELS_FILE_PATH;
 }
 
 
@@ -395,7 +778,12 @@ export async function generateReport(
         rankedUsers = aggregateRanking();
 
         const sheetData: any[] = [];
-        sheetData.push(["Commit's Users", "Changes: additions + deletions", "Merged PRS", "No of Merged PRS", "PRS Reviews", "No of PRS Reviews"]);
+        sheetData.push([
+            "Commit's Users", "Changes: additions + deletions", 
+            "Merged PRS", "No of Merged PRS", 
+            "PRS Reviews", "No of PRS Reviews"
+        ]);
+        
         const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length);
         for(let i = 0; i < maxRows; i++) {
             sheetData.push([
@@ -410,19 +798,24 @@ export async function generateReport(
 
         const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
         worksheet['!cols'] = [
-            {wch: 20},
-            {wch: 10},
-            {wch: 20},
-            {wch: 12},
-            {wch: 20},
-            {wch: 12},
+            {wch: 20}, // Commit's Users
+            {wch: 10}, // Changes: additions + deletions  
+            {wch: 20}, // Merged PRS
+            {wch: 12}, // No of Merged PRS
+            {wch: 20}, // PRS Reviews
+            {wch: 12}, // No of PRS Reviews
         ];
         xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
     }
 
-    // Send the report via email
+    // Generate the labels report
+    console.log("🏷️  Starting labels report generation...");
+    const labelsReportPath = await generateLabelsReport(repoOwner);
+    console.log("✅ Labels report generation completed!");
+    
+    // Send the reports via email
     const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
-    await sendEmailWithAttachment(attachment, rankedUsers);
+    await sendEmailWithAttachments(attachment, rankedUsers, labelsReportPath);
 }
 
 
