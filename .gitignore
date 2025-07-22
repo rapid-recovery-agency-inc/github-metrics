@@ -1,5 +1,4 @@
 node_modules
-.env
 .DS_Store
 dist/*
 .vscode/*
@@ -11,4 +10,4 @@ dist/*
 .idea/
 GitHub_Metrics_Report.xlsx
 disk-cache/
-.env
+config.bat

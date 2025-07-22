@@ -134,8 +134,13 @@ export const fetchCommitsInDateRange = async (
 
 
 export const aggregateCommits = (commits: GraphQLCommit[]): Record<string, AggregateCommits> => {
+    // Lista de usuarios problemáticos para debuggear
+    const USERS_TO_DEBUG = ['juansebasmarin', 'anjelysleal', 'nicolas-toledo'];
+    
+    console.log("🔍 DEBUG: aggregateCommits - Total commits a procesar:", commits.length);
+    
     const aggregate: Record<string, AggregateCommits> = {};
-    commits.forEach((commit) => {
+    commits.forEach((commit, index) => {
         if (!commit) {
             return;
         }
@@ -147,6 +152,23 @@ export const aggregateCommits = (commits: GraphQLCommit[]): Record<string, Aggre
         if (author === "Unknown" && commit.author) {
             author = commit.author.name ?? "Unknown";
         }
+        
+        // Debug: Verificar si este commit es de uno de nuestros usuarios problemáticos
+        if (USERS_TO_DEBUG.some(user => user.toLowerCase() === author.toLowerCase()) || 
+            USERS_TO_DEBUG.some(user => commit.author?.name?.toLowerCase().includes(user.toLowerCase())) ||
+            USERS_TO_DEBUG.some(user => commit.author?.email?.toLowerCase().includes(user.toLowerCase()))) {
+            console.log(`🔍 DEBUG: aggregateCommits - Commit ${index + 1} de usuario problemático:`, {
+                author,
+                oid: commit.oid,
+                authorFromLogin: commit.authors?.nodes?.[0]?.user?.login,
+                authorFromName: commit.author?.name,
+                authorFromEmail: commit.author?.email,
+                additions: commit.additions,
+                deletions: commit.deletions,
+                message: commit.message?.substring(0, 50)
+            });
+        }
+        
         const record: AggregateCommits = aggregate[author] ?? {
             additions: 0,
             deletions: 0,
@@ -155,5 +177,19 @@ export const aggregateCommits = (commits: GraphQLCommit[]): Record<string, Aggre
         record.deletions += commit.deletions ?? 0;
         aggregate[author] = record;
     });
+    
+    // Debug: Verificar resultado de agregación para usuarios problemáticos
+    console.log("🔍 DEBUG: aggregateCommits - Resultado para usuarios problemáticos:");
+    USERS_TO_DEBUG.forEach(user => {
+        const found = Object.keys(aggregate).find(key => 
+            key.toLowerCase() === user.toLowerCase()
+        );
+        if (found) {
+            console.log(`✅ DEBUG: aggregateCommits - Usuario ${user} encontrado como "${found}":`, aggregate[found]);
+        } else {
+            console.log(`❌ DEBUG: aggregateCommits - Usuario ${user} NO encontrado`);
+        }
+    });
+    
     return aggregate;
 }
