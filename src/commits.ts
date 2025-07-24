@@ -1,5 +1,5 @@
 import {AggregateCommits, GraphQLCommit, GraphQLCommitsResponse} from "./types";
-import {sleep} from "./utils";
+import {sleep, retryWithBackoff} from "./utils";
 import {COMMITS_CACHE} from "./cache";
 import fetch from "node-fetch";
 import { GITHUB_GRAPHQL_API} from "./constants";
@@ -64,32 +64,37 @@ const fetchCommits = async (
     mainLoop:
         while (hasMore) {
             const variables = {repoOwner, repository, since, until, cursor};
-            const response = await fetch(GITHUB_GRAPHQL_API, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                },
-                body: JSON.stringify({
-                    query: COMMITS_QUERY,
-                    variables,
-                }),
-            });
-            // Check rate limit headers
-            const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
-            const rateLimitReset = response.headers.get("x-ratelimit-reset");
-            if (rateLimitRemaining === "0" && rateLimitReset) {
-                const resetTime = parseInt(rateLimitReset, 10) * 1000;
-                const currentTime = Date.now();
-                const waitTime = resetTime - currentTime;
-                if (waitTime > 0) {
-                    await sleep(waitTime);
-                    continue;
+            
+            const result = await retryWithBackoff(async () => {
+                const response = await fetch(GITHUB_GRAPHQL_API, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                    },
+                    body: JSON.stringify({
+                        query: COMMITS_QUERY,
+                        variables,
+                    }),
+                });
+                
+                // Check rate limit headers
+                const rateLimitRemaining = response.headers.get("x-ratelimit-remaining");
+                const rateLimitReset = response.headers.get("x-ratelimit-reset");
+                if (rateLimitRemaining === "0" && rateLimitReset) {
+                    const resetTime = parseInt(rateLimitReset, 10) * 1000;
+                    const currentTime = Date.now();
+                    const waitTime = resetTime - currentTime;
+                    if (waitTime > 0) {
+                        await sleep(waitTime);
+                        throw new Error("Rate limit exceeded, will retry after delay");
+                    }
                 }
-            }
-            const result: GraphQLCommitsResponse = (await response.json()) as GraphQLCommitsResponse;
+                
+                return await response.json() as GraphQLCommitsResponse;
+            }, 5, 3000, `fetchCommits(${repository})`);
             if (result.errors) {
-                console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors, response.headers);
+                console.error("GraphQL errors:fetchCommitsInDateRange:", result.errors);
                 for (let i = 0; i < result.errors.length; i++) {
                     const error = result.errors[i];
                     if (error.type === "RATE_LIMITED") {

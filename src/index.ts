@@ -16,7 +16,7 @@ import {
     ReviewsForPullRequest
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
-import {PRS_CACHE, PRS_REVIEW_CACHE, ISSUES_CACHE, ISSUE_EVENTS_CACHE} from "./cache.js";
+import {PRS_CACHE, PRS_REVIEW_CACHE, ISSUES_CACHE, ISSUE_EVENTS_CACHE, cleanupAllCaches, closeAllCaches} from "./cache.js";
 import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API} from "./constants";
 import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
 import {debugToFile} from "./debug";
@@ -723,17 +723,54 @@ async function generateLabelsReport(repoOwner: string) {
 }
 
 
+// Preload cache for better performance
+async function preloadCacheForDateRange(
+    repoOwner: string,
+    repositories: string[],
+    startDate: Date,
+    endDate: Date
+): Promise<void> {
+    console.log("🚀 Preloading cache for better performance...");
+    
+    const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
+    
+    // Preload commits cache
+    for (const {since, until} of dateIntervals) {
+        for (const repo of repositories) {
+            const cacheKey = `${repoOwner}-${repo}-${since}-${until}`;
+            await ISSUES_CACHE.preloadKey(cacheKey);
+        }
+    }
+    
+    // Preload pull requests cache
+    for (const {since, until} of dateIntervals) {
+        const cacheKey = `${repoOwner}-${since}-${until}`;
+        await PRS_CACHE.preloadKey(cacheKey);
+    }
+    
+    console.log("✅ Cache preloading completed");
+}
+
 // Function to generate reports for multiple time PERIODS
 export async function generateReport(
     repoOwner: string,
 ) {
-    const repositories = await fetchRepositories(repoOwner);
-    //
-    const workbook = xlsx.utils.book_new();
-    const endDate = new Date();
-    // We need to start from yesterday
-    endDate.setDate(endDate.getDate() - 1);
-    let rankedUsers: RankedUser[] = [];
+    try {
+        const repositories = await fetchRepositories(repoOwner);
+        
+        // Cleanup expired cache entries
+        await cleanupAllCaches();
+        
+        const workbook = xlsx.utils.book_new();
+        const endDate = new Date();
+        // We need to start from yesterday
+        endDate.setDate(endDate.getDate() - 1);
+        let rankedUsers: RankedUser[] = [];
+        
+        // Preload cache for the longest period (12 weeks) to cover all cases
+        const longestStartDate = new Date();
+        longestStartDate.setDate(endDate.getDate() - 12 * 7);
+        await preloadCacheForDateRange(repoOwner, repositories, longestStartDate, endDate);
 
     for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
         const startDate = new Date();
@@ -843,6 +880,14 @@ export async function generateReport(
     // Send the reports via email
     const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
     await sendEmailWithAttachments(attachment, rankedUsers, labelsReportPath);
+    
+    } catch (error) {
+        console.error("❌ Error generating report:", error);
+        throw error;
+    } finally {
+        // Close all cache connections gracefully
+        await closeAllCaches();
+    }
 }
 
 

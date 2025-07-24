@@ -68,3 +68,42 @@ export async function handleRateLimit(response: any) {
         await new Promise((resolve) => setTimeout(resolve, waitTime));
     }
 }
+
+// Retry logic for network failures
+export async function retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    maxRetries: number = 3,
+    baseDelay: number = 1000,
+    operationName: string = "operation"
+): Promise<T> {
+    let lastError: Error;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error: any) {
+            lastError = error;
+            
+            // Check if it's a network error we should retry
+            const isRetryableError = 
+                error.code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+                error.code === 'ECONNRESET' ||
+                error.code === 'ETIMEDOUT' ||
+                error.type === 'system' ||
+                (error.status && [502, 503, 504, 429].includes(error.status));
+            
+            if (!isRetryableError || attempt === maxRetries) {
+                console.error(`❌ ${operationName} failed after ${attempt} attempts:`, error.message);
+                throw error;
+            }
+            
+            const delay = baseDelay * Math.pow(2, attempt - 1);
+            console.log(`⚠️  ${operationName} failed (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms...`);
+            console.log(`   Error: ${error.message}`);
+            
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+    
+    throw lastError!;
+}

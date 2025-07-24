@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/serve.ts",
     "run": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run.ts ",
-    "start:local": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/index.ts"
+    "start:local": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/index.ts",
+    "migrate-cache": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run-migration.ts"
   },
   "engines": {
     "node": ">=20"
@@ -16,6 +17,7 @@
     "@octokit/rest": "21.0.2",
     "@octokit/types": "^13.5.1",
     "@types/node-fetch": "^2.6.11",
+    "@types/sqlite3": "^5.1.0",
     "cli-progress": "^3.12.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -26,6 +28,7 @@
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
     "octokit": "^4.0.2",
+    "sqlite3": "^5.1.7",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
