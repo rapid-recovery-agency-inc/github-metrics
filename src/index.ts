@@ -54,16 +54,12 @@ const PERIODS: Record<number, string> = {
 const MAX_RETRIES = 3;
 
 
-// Function to fetch all commits within a given date range using date intervals
-
-
 // Function to fetch all pull requests within a given date range using date intervals
 async function fetchPullRequestsInDateRange(
     repoOwner: string,
     startDate: Date,
     endDate: Date
 ) {
-    console.log("DEBUG:fetchPullRequestsInDateRange:", repoOwner, startDate, endDate);
     const allPullRequests: RestIssueAndPullRequest[] = [];
     const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
     for (const {since, until} of dateIntervals) {
@@ -99,7 +95,6 @@ async function fetchPullRequestsInDateRange(
             }
         }
     }
-    console.log("DEBUG:allPullRequests:", JSON.stringify(allPullRequests, null, 1));
     return allPullRequests;
 }
 
@@ -108,7 +103,6 @@ async function fetchReviewsForPR(
     repoName: string,
     prNumber: number
 ): Promise<ReviewsForPullRequest> {
-    console.log("DEBUG:fetchReviewsForPR:", repoOwner, repoName, prNumber);
     const allReviews: GraphQLReview[] = [];
     const allReviewThreads: GraphQLReviewThread[] = [];
     const cacheKey = `${repoOwner}-${repoName}-${prNumber}`;
@@ -243,7 +237,6 @@ async function fetchIssuesInDateRange(
     startDate: Date,
     endDate: Date
 ): Promise<RestIssue[]> {
-    console.log("DEBUG:fetchIssuesInDateRange:", repoOwner, startDate, endDate);
     const allIssues: RestIssue[] = [];
     const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
     
@@ -296,7 +289,6 @@ async function fetchLabelEventsForIssue(
     startDate: Date,
     endDate: Date
 ): Promise<IssueEvent[]> {
-    console.log("DEBUG:fetchLabelEventsForIssue:", repoOwner, repoName, issueNumber);
     const cacheKey = `${repoOwner}-${repoName}-issue-${issueNumber}-events`;
     const cachedResult = ISSUE_EVENTS_CACHE.get<IssueEvent[]>(cacheKey);
     if (cachedResult) {
@@ -336,7 +328,6 @@ async function aggregateLabelMetricsByRepo(
     startDate: Date,
     endDate: Date
 ): Promise<Record<string, LabelMetrics>> {
-    console.log("DEBUG:aggregateLabelMetricsByRepo:", repoOwner, startDate, endDate);
     const repoLabelMetrics: Record<string, LabelMetrics> = {};
     
     const issues = await fetchIssuesInDateRange(repoOwner, startDate, endDate);
@@ -383,7 +374,6 @@ async function getIssuesCreatedByRepo(
     startDate: Date,
     endDate: Date
 ): Promise<Record<string, number>> {
-    console.log("DEBUG:getIssuesCreatedByRepo:", repoOwner, startDate, endDate);
     const repoIssueCount: Record<string, number> = {};
     
     const issues = await fetchIssuesInDateRange(repoOwner, startDate, endDate);
@@ -415,6 +405,7 @@ const aggregateMetricsByDateRange = async (
     );
     const repoLabelMetrics = await aggregateLabelMetricsByRepo(repoOwner, repositories, startDate, endDate);
     const aggregatedCommits = aggregateCommits(commits);
+    
     Object.entries(aggregatedCommits).forEach(([author, data]) => {
         rawUserMetrics[author] = {
             commits: data.additions + data.deletions,
@@ -427,8 +418,7 @@ const aggregateMetricsByDateRange = async (
             otherLabels: 0,
         };
     });
-    console.log("DEBUG:aggregatedCommits:", aggregatedCommits);
-    console.log("DEBUG:rawUserMetrics:", rawUserMetrics);
+    
     for (const pr of pullRequests) {
         const author = pr.user?.login || "Unknown";
         const repoName = `${pr.repository_url.split("/").pop()}`;
@@ -446,8 +436,10 @@ const aggregateMetricsByDateRange = async (
         rawUserMetrics[author].pullRequests += 1;
         // Fetch reviews for the current PR
         const {reviews, reviewThreads} = await fetchReviewsForPR(repoOwner, repoName, pr.number);
+        
         reviews.forEach((review) => {
             const reviewer = review.author?.login || "Unknown";
+            
             rawUserMetrics[reviewer] = rawUserMetrics[reviewer] || {
                 commits: 0,
                 pullRequests: 0,
@@ -471,6 +463,7 @@ const aggregateMetricsByDateRange = async (
 
             reviewThreads.forEach((reviewThread) => {
                 const threadAuthor = reviewThread?.comments?.edges[0]?.node?.author?.login ?? 'Unknown';
+                
                 rawUserMetrics[threadAuthor] = rawUserMetrics[threadAuthor] || {
                     commits: 0,
                     pullRequests: 0,
@@ -485,7 +478,7 @@ const aggregateMetricsByDateRange = async (
             })
         });
     }
-    console.log("DEBUG:rawUserMetrics:", rawUserMetrics);
+    
     const mergedUserMetrics: Record<string, AggregateMetrics> = {};
     Object.entries(rawUserMetrics).forEach(([author, data]) => {
         const normalizedAuthor = author.toLowerCase();
@@ -514,7 +507,7 @@ const aggregateMetricsByDateRange = async (
         record.otherLabels += data.otherLabels;
         mergedUserMetrics[realAuthor] = record;
     });
-    console.log("DEBUG:mergedUserMetrics:", mergedUserMetrics);
+    
     return mergedUserMetrics;
 }
 
@@ -541,11 +534,10 @@ async function sendEmailWithAttachments(attachment: Buffer, aggregateRanking: Ra
     
     await sendTemplateEmail({
         users: [
-            {email: 'estebanpersonal20@gmail.com'},
-            // {email: 'alacret@insightt.io'},
-            // {email: 'ysouki@insightt.io'},
-            // {email: 'ezabala@insightt.io'},
-            // {email: 'lpena@insightt.io'}
+            {email: 'alacret@insightt.io'},
+            {email: 'ysouki@insightt.io'},
+            {email: 'ezabala@insightt.io'},
+            {email: 'lpena@insightt.io'}
         ],
         subject: "GitHub Metrics Report",
         body: `${rankedListString}<br/><br/>Note: Labels report is included as a separate attachment.`,
@@ -566,17 +558,13 @@ async function getDetailedLabelMetricsByRepo(
     otherLabels: string[];
     issuesCreatedByRepo: Record<string, number>;
 }> {
-    console.log("🔍 DEBUG:getDetailedLabelMetricsByRepo:", repoOwner, startDate.toISOString().split('T')[0], endDate.toISOString().split('T')[0]);
     const repoLabelMetrics: Record<string, Record<string, number>> = {};
     const allOtherLabels = new Set<string>();
     const issuesCreatedByRepo: Record<string, number> = {};
     
-    console.log("📥 Fetching issues in date range...");
     const issues = await fetchIssuesInDateRange(repoOwner, startDate, endDate);
-    console.log(`📋 Found ${issues.length} issues to process`);
     
-    for (let i = 0; i < issues.length; i++) {
-        const issue = issues[i];
+    for (const issue of issues) {
         const repoName = issue.repository_url.split("/").pop() || "unknown";
         
         // Count issues created
@@ -590,11 +578,6 @@ async function getDetailedLabelMetricsByRepo(
                 'Bug label': 0,
                 'Enhancement label': 0,
             };
-        }
-        
-        // Show progress every 10 issues
-        if (i % 10 === 0) {
-            console.log(`📊 Processing issue ${i + 1}/${issues.length}: #${issue.number} in ${repoName}`);
         }
         
         // Get label events for this issue in the date range
@@ -654,7 +637,6 @@ async function getDetailedLabelMetricsByRepo(
 async function generateLabelsReport(repoOwner: string) {
     console.log("🏷️  Generating comprehensive labels report...");
     const repositories = await fetchRepositories(repoOwner);
-    console.log(`📚 Found ${repositories.length} repositories`);
     const workbook = xlsx.utils.book_new();
     const endDate = new Date();
     endDate.setDate(endDate.getDate() - 1);
@@ -662,10 +644,8 @@ async function generateLabelsReport(repoOwner: string) {
     for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
         const startDate = new Date();
         startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
-        console.log(`📅 Processing labels for period: ${periodName} (${startDate.toISOString().split('T')[0]} to ${endDate.toISOString().split('T')[0]})`);
         
         const { repoMetrics, otherLabels, issuesCreatedByRepo } = await getDetailedLabelMetricsByRepo(repoOwner, repositories, startDate, endDate);
-        console.log(`🏷️  Found ${otherLabels.length} unique other labels for ${periodName}`);
         
         // Create header row: Repo | Issues created | Bug label | Enhancement label | otherLabel1 | otherLabel2 | ...
         const headerRow = [
@@ -772,115 +752,112 @@ export async function generateReport(
         longestStartDate.setDate(endDate.getDate() - 12 * 7);
         await preloadCacheForDateRange(repoOwner, repositories, longestStartDate, endDate);
 
-    for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
-        const startDate = new Date();
-        startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
-        const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
-        const commitsData = Object.entries(report)
-            .map((item: any) => {
-                return {
-                    author: String(item[0]).toLowerCase(),
-                    commits: item[1].commits,
-                };
-            })
-            .sort((a, b) => b.commits - a.commits);
-        const mergedPrsData = Object.entries(report)
-            .map((item: any) => {
-                return {
-                    author: String(item[0]).toLowerCase(),
-                    pullRequests: item[1].pullRequests,
-                };
-            })
-            .sort((a, b) => b.pullRequests - a.pullRequests);
-        const prsReviewsData = Object.entries(report)
-            .map((item: any) => {
-                return {
-                    author: String(item[0]).toLowerCase(),
-                    score: item[1].score,
-                };
-            })
-            .sort((a, b) => b.score - a.score);
-        const prsRejectionsData = Object.entries(report)
-            .map((item: any) => {
-                return {
-                    author: String(item[0]).toLowerCase(),
-                    rejections: item[1].rejections,
-                };
-            })
-            .sort((a, b) => b.rejections - a.rejections);
-        console.log("DEBUG:commitsData:", commitsData);
-        console.log("DEBUG:mergedPrsData:", mergedPrsData);
-        console.log("DEBUG:prsReviewsData:", prsReviewsData);
-        console.log("DEBUG:prsRejectionsData:", prsRejectionsData);
-        //Create a function to calculate the aggregate ranking
-        const aggregateRanking = (): RankedUser[] => {
-            const rankingMap: { [key: string]: number } = {};
+        for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
+            const startDate = new Date();
+            startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
+            const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
+            const commitsData = Object.entries(report)
+                .map((item: any) => {
+                    return {
+                        author: String(item[0]).toLowerCase(),
+                        commits: item[1].commits,
+                    };
+                })
+                .sort((a, b) => b.commits - a.commits);
+            const mergedPrsData = Object.entries(report)
+                .map((item: any) => {
+                    return {
+                        author: String(item[0]).toLowerCase(),
+                        pullRequests: item[1].pullRequests,
+                    };
+                })
+                .sort((a, b) => b.pullRequests - a.pullRequests);
+            const prsReviewsData = Object.entries(report)
+                .map((item: any) => {
+                    return {
+                        author: String(item[0]).toLowerCase(),
+                        score: item[1].score,
+                    };
+                })
+                .sort((a, b) => b.score - a.score);
+            const prsRejectionsData = Object.entries(report)
+                .map((item: any) => {
+                    return {
+                        author: String(item[0]).toLowerCase(),
+                        rejections: item[1].rejections,
+                    };
+                })
+                .sort((a, b) => b.rejections - a.rejections);
 
-            const sumIndexes = (array: any[]) => {
-                array.forEach((item, index) => {
-                    const user = item.author;
-                    if (!rankingMap[user]) rankingMap[user] = 0;
-                    rankingMap[user] += index;
-                });
+            //Create a function to calculate the aggregate ranking
+            const aggregateRanking = (): RankedUser[] => {
+                const rankingMap: { [key: string]: number } = {};
+
+                const sumIndexes = (array: any[]) => {
+                    array.forEach((item, index) => {
+                        const user = item.author;
+                        if (!rankingMap[user]) rankingMap[user] = 0;
+                        rankingMap[user] += index;
+                    });
+                };
+
+                sumIndexes(commitsData);
+                sumIndexes(mergedPrsData);
+                sumIndexes(prsReviewsData);
+                sumIndexes(prsRejectionsData);
+
+                return Object.entries(rankingMap)
+                    .map(([user, totalIndex]) => ({user, totalIndex}))
+                    .sort((a, b) => a.totalIndex - b.totalIndex);
             };
 
-            sumIndexes(commitsData);
-            sumIndexes(mergedPrsData);
-            sumIndexes(prsReviewsData);
-            sumIndexes(prsRejectionsData);
+            rankedUsers = aggregateRanking();
 
-            return Object.entries(rankingMap)
-                .map(([user, totalIndex]) => ({user, totalIndex}))
-                .sort((a, b) => a.totalIndex - b.totalIndex);
-        };
-
-        rankedUsers = aggregateRanking();
-
-        const sheetData: any[] = [];
-        sheetData.push([
-            "Commit's Users", "Changes: additions + deletions", 
-            "Merged PRS", "No of Merged PRS", 
-            "PRS Reviews", "No of PRS Reviews",
-            "Prs Rejected", "Nr of Prs Rejected"
-        ]);
-        
-        const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length, prsRejectionsData.length);
-        for(let i = 0; i < maxRows; i++) {
+            const sheetData: any[] = [];
             sheetData.push([
-                i < commitsData.length ? `${i + 1}.  ${commitsData[i].author}` : "",
-                i < commitsData.length ? `${commitsData[i].commits}` : "",
-                i < mergedPrsData.length ? `${i + 1}.  ${mergedPrsData[i].author}` : "",
-                i < mergedPrsData.length ? `${mergedPrsData[i].pullRequests}` : "",
-                i < prsReviewsData.length ? `${i + 1}.  ${prsReviewsData[i].author}` : "",
-                i < prsReviewsData.length ? `${parseFloat(prsReviewsData[i].score.toFixed(1))}` : "",
-                i < prsRejectionsData.length ? `${i + 1}.  ${prsRejectionsData[i].author}` : "",
-                i < prsRejectionsData.length ? `${prsRejectionsData[i].rejections}` : "",
+                "Commit's Users", "Changes: additions + deletions", 
+                "Merged PRS", "No of Merged PRS", 
+                "PRS Reviews", "No of PRS Reviews",
+                "Prs Rejected", "Nr of Prs Rejected"
             ]);
+            
+            const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length, prsRejectionsData.length);
+            for(let i = 0; i < maxRows; i++) {
+                sheetData.push([
+                    i < commitsData.length ? `${i + 1}.  ${commitsData[i].author}` : "",
+                    i < commitsData.length ? `${commitsData[i].commits}` : "",
+                    i < mergedPrsData.length ? `${i + 1}.  ${mergedPrsData[i].author}` : "",
+                    i < mergedPrsData.length ? `${mergedPrsData[i].pullRequests}` : "",
+                    i < prsReviewsData.length ? `${i + 1}.  ${prsReviewsData[i].author}` : "",
+                    i < prsReviewsData.length ? `${parseFloat(prsReviewsData[i].score.toFixed(1))}` : "",
+                    i < prsRejectionsData.length ? `${i + 1}.  ${prsRejectionsData[i].author}` : "",
+                    i < prsRejectionsData.length ? `${prsRejectionsData[i].rejections}` : "",
+                ]);
+            }
+
+            const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
+            worksheet['!cols'] = [
+                {wch: 20}, // Commit's Users
+                {wch: 10}, // Changes: additions + deletions  
+                {wch: 20}, // Merged PRS
+                {wch: 12}, // No of Merged PRS
+                {wch: 20}, // PRS Reviews
+                {wch: 12}, // No of PRS Reviews
+                {wch: 20}, // Prs Rejected
+                {wch: 15}, // Nr of Prs Rejected
+            ];
+            xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
         }
 
-        const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
-        worksheet['!cols'] = [
-            {wch: 20}, // Commit's Users
-            {wch: 10}, // Changes: additions + deletions  
-            {wch: 20}, // Merged PRS
-            {wch: 12}, // No of Merged PRS
-            {wch: 20}, // PRS Reviews
-            {wch: 12}, // No of PRS Reviews
-            {wch: 20}, // Prs Rejected
-            {wch: 15}, // Nr of Prs Rejected
-        ];
-        xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
-    }
-
-    // Generate the labels report
-    console.log("🏷️  Starting labels report generation...");
-    const labelsReportPath = await generateLabelsReport(repoOwner);
-    console.log("✅ Labels report generation completed!");
-    
-    // Send the reports via email
-    const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
-    await sendEmailWithAttachments(attachment, rankedUsers, labelsReportPath);
-    
+        // Generate the labels report
+        console.log("🏷️  Starting labels report generation...");
+        const labelsReportPath = await generateLabelsReport(repoOwner);
+        console.log("✅ Labels report generation completed!");
+        
+        // Send the reports via email
+        const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
+        await sendEmailWithAttachments(attachment, rankedUsers, labelsReportPath);
+        
     } catch (error) {
         console.error("❌ Error generating report:", error);
         throw error;

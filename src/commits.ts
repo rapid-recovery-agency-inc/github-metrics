@@ -50,7 +50,6 @@ const fetchCommits = async (
     since: string,
     until: string,
 ): Promise<GraphQLCommit[]> => {
-    console.log("DEBUG:fetchCommits:", repoOwner, repository, since, until);
     const allCommits: GraphQLCommit[] = [];
     const cacheKey = `${repoOwner}-${repository}-${since}-${until}`;
     const cachedResult = COMMITS_CACHE.get<GraphQLCommit[]>(cacheKey);
@@ -124,7 +123,6 @@ export const fetchCommitsInDateRange = async (
     startDate: Date,
     endDate: Date
 ): Promise<GraphQLCommit[]> => {
-    console.log("DEBUG:fetchCommitsInDateRange:", repoOwner, repositories, startDate, endDate);
     const allCommits: GraphQLCommit[] = [];
     for (const repository of repositories) {
         const commits = await fetchCommits(repoOwner, repository, startDate.toISOString(), endDate.toISOString());
