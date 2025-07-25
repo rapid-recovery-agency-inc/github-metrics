@@ -23,7 +23,6 @@ const REPOSITORIES_QUERY = `
 export const fetchRepositories = async (
     repoOwner: string,
 ): Promise<string[]> => {
-    console.log("DEBUG:fetchRepositories:", repoOwner);
     const allRepositories: string[] = [];
     let cursor: string | null = null;
     let hasMore = true;

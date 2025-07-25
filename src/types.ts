@@ -97,6 +97,7 @@ export interface GraphQLReview {
     author?:{
         login: string;
     }
+    state: string;
 }
 
 export interface GraphQLReviewNode {
@@ -133,5 +134,48 @@ export interface AggregateMetrics {
     commits: number;
     pullRequests: number;
     reviews: number;
+    rejections: number;
     score: number;
+    bugLabels: number;
+    enhancementLabels: number;
+    otherLabels: number;
+}
+
+export interface RestIssue {
+    number: number;
+    repository_url: string;
+    html_url: string;
+    title: string;
+    user: {
+        login: string;
+    }
+    state: string;
+    created_at: string;
+    closed_at: string;
+    labels: {
+        name: string;
+        color: string;
+    }[];
+}
+
+export interface IssueEvent {
+    event: string;
+    created_at: string;
+    actor: {
+        login: string;
+    } | null;
+    label?: {
+        name: string;
+        color: string;
+    };
+}
+
+export interface LabelMetrics {
+    bugLabels: number;
+    enhancementLabels: number;
+    otherLabels: number;
+}
+
+export interface RepoLabelMetrics {
+    [repoName: string]: LabelMetrics;
 }
