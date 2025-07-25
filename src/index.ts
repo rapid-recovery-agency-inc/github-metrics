@@ -455,7 +455,7 @@ const aggregateMetricsByDateRange = async (
             
             // Check if this review is a rejection (CHANGES_REQUESTED)
             if (review.state === 'CHANGES_REQUESTED') {
-                rawUserMetrics[reviewer].rejections += 1;
+                rawUserMetrics[author].rejections += 1;
             }
             
             // Add 1 point for the review
