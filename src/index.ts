@@ -17,7 +17,7 @@ import {
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
 import {PRS_CACHE, PRS_REVIEW_CACHE, ISSUES_CACHE, ISSUE_EVENTS_CACHE, cleanupAllCaches, closeAllCaches} from "./cache.js";
-import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API} from "./constants";
+import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API, EXCLUDED_FROM_RANKINGS} from "./constants";
 import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
 import {debugToFile} from "./debug";
 import {fetchRepositories} from "./repositories";
@@ -485,6 +485,9 @@ const aggregateMetricsByDateRange = async (
         if (BLACKLISTED_CODE_USERS.has(author)) { // Ignore metrics for blacklisted users
             return;
         }
+        if (EXCLUDED_FROM_RANKINGS.has(normalizedAuthor)) { // Exclude users from rankings (system accounts, etc.)
+            return;
+        }
         const aliasAuthor = AUTHOR_ALIAS_MAP.get(normalizedAuthor);
         const realAuthor = aliasAuthor ?? normalizedAuthor;
         const record = mergedUserMetrics[realAuthor] ?? {
@@ -736,50 +739,50 @@ export async function generateReport(
     repoOwner: string,
 ) {
     try {
-        const repositories = await fetchRepositories(repoOwner);
+    const repositories = await fetchRepositories(repoOwner);
         
         // Cleanup expired cache entries
         await cleanupAllCaches();
         
-        const workbook = xlsx.utils.book_new();
-        const endDate = new Date();
-        // We need to start from yesterday
-        endDate.setDate(endDate.getDate() - 1);
-        let rankedUsers: RankedUser[] = [];
+    const workbook = xlsx.utils.book_new();
+    const endDate = new Date();
+    // We need to start from yesterday
+    endDate.setDate(endDate.getDate() - 1);
+    let rankedUsers: RankedUser[] = [];
         
         // Preload cache for the longest period (12 weeks) to cover all cases
         const longestStartDate = new Date();
         longestStartDate.setDate(endDate.getDate() - 12 * 7);
         await preloadCacheForDateRange(repoOwner, repositories, longestStartDate, endDate);
 
-        for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
-            const startDate = new Date();
-            startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
-            const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
-            const commitsData = Object.entries(report)
-                .map((item: any) => {
-                    return {
-                        author: String(item[0]).toLowerCase(),
-                        commits: item[1].commits,
-                    };
-                })
-                .sort((a, b) => b.commits - a.commits);
-            const mergedPrsData = Object.entries(report)
-                .map((item: any) => {
-                    return {
-                        author: String(item[0]).toLowerCase(),
-                        pullRequests: item[1].pullRequests,
-                    };
-                })
-                .sort((a, b) => b.pullRequests - a.pullRequests);
-            const prsReviewsData = Object.entries(report)
-                .map((item: any) => {
-                    return {
-                        author: String(item[0]).toLowerCase(),
-                        score: item[1].score,
-                    };
-                })
-                .sort((a, b) => b.score - a.score);
+    for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
+        const startDate = new Date();
+        startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
+        const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
+        const commitsData = Object.entries(report)
+            .map((item: any) => {
+                return {
+                    author: String(item[0]).toLowerCase(),
+                    commits: item[1].commits,
+                };
+            })
+            .sort((a, b) => b.commits - a.commits);
+        const mergedPrsData = Object.entries(report)
+            .map((item: any) => {
+                return {
+                    author: String(item[0]).toLowerCase(),
+                    pullRequests: item[1].pullRequests,
+                };
+            })
+            .sort((a, b) => b.pullRequests - a.pullRequests);
+        const prsReviewsData = Object.entries(report)
+            .map((item: any) => {
+                return {
+                    author: String(item[0]).toLowerCase(),
+                    score: item[1].score,
+                };
+            })
+            .sort((a, b) => b.score - a.score);
             const prsRejectionsData = Object.entries(report)
                 .map((item: any) => {
                     return {
@@ -789,65 +792,65 @@ export async function generateReport(
                 })
                 .sort((a, b) => b.rejections - a.rejections);
 
-            //Create a function to calculate the aggregate ranking
-            const aggregateRanking = (): RankedUser[] => {
-                const rankingMap: { [key: string]: number } = {};
+        //Create a function to calculate the aggregate ranking
+        const aggregateRanking = (): RankedUser[] => {
+            const rankingMap: { [key: string]: number } = {};
 
-                const sumIndexes = (array: any[]) => {
-                    array.forEach((item, index) => {
-                        const user = item.author;
-                        if (!rankingMap[user]) rankingMap[user] = 0;
-                        rankingMap[user] += index;
-                    });
-                };
-
-                sumIndexes(commitsData);
-                sumIndexes(mergedPrsData);
-                sumIndexes(prsReviewsData);
-                sumIndexes(prsRejectionsData);
-
-                return Object.entries(rankingMap)
-                    .map(([user, totalIndex]) => ({user, totalIndex}))
-                    .sort((a, b) => a.totalIndex - b.totalIndex);
+            const sumIndexes = (array: any[]) => {
+                array.forEach((item, index) => {
+                    const user = item.author;
+                    if (!rankingMap[user]) rankingMap[user] = 0;
+                    rankingMap[user] += index;
+                });
             };
 
-            rankedUsers = aggregateRanking();
+            sumIndexes(commitsData);
+            sumIndexes(mergedPrsData);
+            sumIndexes(prsReviewsData);
+                sumIndexes(prsRejectionsData);
 
-            const sheetData: any[] = [];
-            sheetData.push([
-                "Commit's Users", "Changes: additions + deletions", 
-                "Merged PRS", "No of Merged PRS", 
-                "PRS Reviews", "No of PRS Reviews",
+            return Object.entries(rankingMap)
+                .map(([user, totalIndex]) => ({user, totalIndex}))
+                .sort((a, b) => a.totalIndex - b.totalIndex);
+        };
+
+        rankedUsers = aggregateRanking();
+
+        const sheetData: any[] = [];
+        sheetData.push([
+            "Commit's Users", "Changes: additions + deletions", 
+            "Merged PRS", "No of Merged PRS", 
+            "PRS Reviews", "No of PRS Reviews",
                 "Prs Rejected", "Nr of Prs Rejected"
-            ]);
-            
+        ]);
+        
             const maxRows = Math.max(commitsData.length, mergedPrsData.length, prsReviewsData.length, prsRejectionsData.length);
-            for(let i = 0; i < maxRows; i++) {
-                sheetData.push([
-                    i < commitsData.length ? `${i + 1}.  ${commitsData[i].author}` : "",
-                    i < commitsData.length ? `${commitsData[i].commits}` : "",
-                    i < mergedPrsData.length ? `${i + 1}.  ${mergedPrsData[i].author}` : "",
-                    i < mergedPrsData.length ? `${mergedPrsData[i].pullRequests}` : "",
-                    i < prsReviewsData.length ? `${i + 1}.  ${prsReviewsData[i].author}` : "",
-                    i < prsReviewsData.length ? `${parseFloat(prsReviewsData[i].score.toFixed(1))}` : "",
+        for(let i = 0; i < maxRows; i++) {
+            sheetData.push([
+                i < commitsData.length ? `${i + 1}.  ${commitsData[i].author}` : "",
+                i < commitsData.length ? `${commitsData[i].commits}` : "",
+                i < mergedPrsData.length ? `${i + 1}.  ${mergedPrsData[i].author}` : "",
+                i < mergedPrsData.length ? `${mergedPrsData[i].pullRequests}` : "",
+                i < prsReviewsData.length ? `${i + 1}.  ${prsReviewsData[i].author}` : "",
+                i < prsReviewsData.length ? `${parseFloat(prsReviewsData[i].score.toFixed(1))}` : "",
                     i < prsRejectionsData.length ? `${i + 1}.  ${prsRejectionsData[i].author}` : "",
                     i < prsRejectionsData.length ? `${prsRejectionsData[i].rejections}` : "",
-                ]);
-            }
+            ]);
+        }
 
-            const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
-            worksheet['!cols'] = [
-                {wch: 20}, // Commit's Users
-                {wch: 10}, // Changes: additions + deletions  
-                {wch: 20}, // Merged PRS
-                {wch: 12}, // No of Merged PRS
-                {wch: 20}, // PRS Reviews
-                {wch: 12}, // No of PRS Reviews
+        const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
+        worksheet['!cols'] = [
+            {wch: 20}, // Commit's Users
+            {wch: 10}, // Changes: additions + deletions  
+            {wch: 20}, // Merged PRS
+            {wch: 12}, // No of Merged PRS
+            {wch: 20}, // PRS Reviews
+            {wch: 12}, // No of PRS Reviews
                 {wch: 20}, // Prs Rejected
                 {wch: 15}, // Nr of Prs Rejected
-            ];
-            xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
-        }
+        ];
+        xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
+    }
 
         // Generate the labels report
         console.log("🏷️  Starting labels report generation...");
@@ -855,7 +858,7 @@ export async function generateReport(
         console.log("✅ Labels report generation completed!");
         
         // Send the reports via email
-        const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
+    const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
         await sendEmailWithAttachments(attachment, rankedUsers, labelsReportPath);
         
     } catch (error) {
