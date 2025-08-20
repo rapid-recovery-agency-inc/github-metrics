@@ -11,6 +11,11 @@ import {
     GraphQLReviewThreadNode,
     RestIssueAndPullRequest,
     RestIssue,
+    ClosedIssue,
+    IssueComment,
+    IssueParticipation,
+    RankedUser,
+    ClosedIssueRankedUser,
     IssueEvent,
     LabelMetrics,
     ReviewsForPullRequest
@@ -25,10 +30,7 @@ import {fetchRepositories} from "./repositories";
 
 dotenv.config();
 
-interface RankedUser {
-    user: string;
-    totalIndex: number;
-}
+
 
 interface LabelFrequency {
     labelName: string;
@@ -281,6 +283,191 @@ async function fetchIssuesInDateRange(
     return allIssues;
 }
 
+// Function to fetch closed issues within a given date range
+async function fetchClosedIssuesInDateRange(
+    repoOwner: string,
+    startDate: Date,
+    endDate: Date
+): Promise<ClosedIssue[]> {
+    const allClosedIssues: ClosedIssue[] = [];
+    const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
+    
+    for (const {since, until} of dateIntervals) {
+        const cacheKey = `${repoOwner}-closed-issues-${since}-${until}`;
+        const cachedResult = ISSUES_CACHE.get<ClosedIssue[]>(cacheKey);
+        if (cachedResult) {
+            allClosedIssues.push(...cachedResult);
+            continue;
+        }
+        
+        let page = 1;
+        let hasMore = true;
+        const intervalIssues: ClosedIssue[] = [];
+        
+        while (hasMore) {
+            try {
+                // Search for closed issues within the date range
+                const response = await octokit.rest.search.issuesAndPullRequests({
+                    q: `org:${repoOwner} type:issue is:closed closed:${since}..${until}`,
+                    per_page: 100,
+                    page,
+                });
+                
+                await handleRateLimit(response);
+                const closedIssues = response.data.items
+                    .filter((item: any) => !item.pull_request && item.state === 'closed') 
+                    .map((issue: any) => ({
+                        ...issue,
+                        state: 'closed' as const,
+                        assignees: issue.assignees || [],
+                        assignee: issue.assignee || null
+                    })) as ClosedIssue[];
+                    
+                intervalIssues.push(...closedIssues);
+                
+                hasMore = response.data.items.length === 100;
+                page += 1;
+            } catch (error: any) {
+                if (error.status === 403) {
+                    await handleRateLimit(error.response);
+                } else {
+                    console.error(`Error fetching closed issues:`, error);
+                    break;
+                }
+            }
+        }
+        
+        ISSUES_CACHE.set(cacheKey, intervalIssues);
+        allClosedIssues.push(...intervalIssues);
+    }
+    
+    return allClosedIssues;
+}
+
+// Function to fetch comments for an issue
+async function fetchIssueComments(
+    repoOwner: string,
+    repoName: string,
+    issueNumber: number
+): Promise<IssueComment[]> {
+    try {
+        const response = await octokit.rest.issues.listComments({
+            owner: repoOwner,
+            repo: repoName,
+            issue_number: issueNumber,
+            per_page: 100,
+        });
+        
+        await handleRateLimit(response);
+        
+        return response.data.map((comment: any) => ({
+            user: {
+                login: comment.user.login
+            },
+            created_at: comment.created_at,
+            body: comment.body
+        }));
+    } catch (error: any) {
+        console.error(`Error fetching comments for issue ${issueNumber}:`, error);
+        return [];
+    }
+}
+
+// Function to check if an issue is mentioned in any PRs
+async function findPRsMentioningIssue(
+    repoOwner: string,
+    issueNumber: number,
+    startDate: Date,
+    endDate: Date
+): Promise<string[]> {
+    try {
+        // Search for PRs that mention this issue number
+        const response = await octokit.rest.search.issuesAndPullRequests({
+            q: `org:${repoOwner} type:pr ${issueNumber} created:${startDate.toISOString().split('T')[0]}..${endDate.toISOString().split('T')[0]}`,
+            per_page: 100,
+        });
+        
+        await handleRateLimit(response);
+        
+        const mentioningUsers: string[] = [];
+        
+        for (const pr of response.data.items) {
+            if (pr.pull_request && (pr.body?.includes(`#${issueNumber}`) || pr.title.includes(`#${issueNumber}`))) {
+                mentioningUsers.push(pr.user.login);
+            }
+        }
+        
+        return [...new Set(mentioningUsers)]; // Remove duplicates
+    } catch (error: any) {
+        console.error(`Error searching PRs mentioning issue ${issueNumber}:`, error);
+        return [];
+    }
+}
+
+// Function to aggregate participation data for closed issues
+async function aggregateClosedIssueParticipation(
+    repoOwner: string,
+    repositories: string[],
+    startDate: Date,
+    endDate: Date
+): Promise<Record<string, number>> {
+    const participation: Record<string, number> = {};
+    
+    console.log("🔍 Fetching closed issues participation data...");
+    
+    // Fetch all closed issues in the date range
+    const closedIssues = await fetchClosedIssuesInDateRange(repoOwner, startDate, endDate);
+    
+    console.log(`📊 Found ${closedIssues.length} closed issues to analyze`);
+    
+    for (const issue of closedIssues) {
+        const repoName = issue.repository_url.split('/').pop() || '';
+        const participants = new Set<string>();
+        
+        // Add assignees
+        if (issue.assignee) {
+            participants.add(issue.assignee.login);
+        }
+        if (issue.assignees) {
+            issue.assignees.forEach(assignee => participants.add(assignee.login));
+        }
+        
+        // Add commenters
+        try {
+            const comments = await fetchIssueComments(repoOwner, repoName, issue.number);
+            comments.forEach(comment => participants.add(comment.user.login));
+        } catch (error) {
+            console.error(`Error fetching comments for issue ${issue.number}:`, error);
+        }
+        
+        // Add PR mentioners
+        try {
+            const prMentioners = await findPRsMentioningIssue(repoOwner, issue.number, startDate, endDate);
+            prMentioners.forEach(user => participants.add(user));
+        } catch (error) {
+            console.error(`Error finding PR mentions for issue ${issue.number}:`, error);
+        }
+        
+        // Count participation for each user
+        participants.forEach(user => {
+            const normalizedUser = user.toLowerCase();
+            // Skip excluded users
+            if (EXCLUDED_FROM_RANKINGS.has(normalizedUser)) {
+                return;
+            }
+            
+            // Apply alias mapping
+            const aliasUser = AUTHOR_ALIAS_MAP.get(normalizedUser);
+            const realUser = aliasUser ?? normalizedUser;
+            
+            participation[realUser] = (participation[realUser] || 0) + 1;
+        });
+    }
+    
+    console.log(`✅ Participation data aggregated for ${Object.keys(participation).length} users`);
+    return participation;
+}
+
 // Function to fetch label events for an issue
 async function fetchLabelEventsForIssue(
     repoOwner: string,
@@ -520,6 +707,8 @@ async function sendEmailWithAttachments(
     aggregateRanking: RankedUser[], 
     qaRanking: RankedUser[], 
     devRanking: RankedUser[], 
+    closedIssuesQARanking: ClosedIssueRankedUser[],
+    closedIssuesDevRanking: ClosedIssueRankedUser[],
     labelsReportPath?: string
 ) {
     const rankedListString = aggregateRanking.map((rank, index) => {
@@ -532,6 +721,14 @@ async function sendEmailWithAttachments(
     
     const devRankedListString = devRanking.map((rank, index) => {
         return `${index + 1}.  ${rank.user} <br/>`;
+    }).join('\n');
+    
+    const closedIssuesQARankedListString = closedIssuesQARanking.map((rank, index) => {
+        return `${index + 1}.  ${rank.user} (${rank.participation || 0} issues) <br/>`;
+    }).join('\n');
+    
+    const closedIssuesDevRankedListString = closedIssuesDevRanking.map((rank, index) => {
+        return `${index + 1}.  ${rank.user} (${rank.participation || 0} issues) <br/>`;
     }).join('\n');
     
     const attachments = [
@@ -567,8 +764,14 @@ async function sendEmailWithAttachments(
             <h2>💻 Dev Team Ranking</h2>
             ${devRankedListString}
             
+            <h2>🎯 QA Team - Closed Issues Participation</h2>
+            ${closedIssuesQARankedListString}
+            
+            <h2>🎯 Dev Team - Closed Issues Participation</h2>
+            ${closedIssuesDevRankedListString}
+            
             <br/><br/>
-            <strong>Note:</strong> Detailed rankings per team are available in separate Excel sheets. Labels report is included as a separate attachment.
+            <strong>Note:</strong> Detailed rankings per team are available in separate Excel sheets. Closed Issues participation tracks assignees, commenters, and PR mentions. Labels report is included as a separate attachment.
         `,
         attachments: attachments
 
@@ -777,6 +980,8 @@ export async function generateReport(
     let rankedUsers: RankedUser[] = [];
     let qaRanking: RankedUser[] = [];
     let devRanking: RankedUser[] = [];
+    let closedIssuesQARanking: ClosedIssueRankedUser[] = [];
+    let closedIssuesDevRanking: ClosedIssueRankedUser[] = [];
         
         // Preload cache for the longest period (12 weeks) to cover all cases
         const longestStartDate = new Date();
@@ -862,6 +1067,34 @@ export async function generateReport(
         // Create separate rankings
         qaRanking = createRanking(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData);
         devRanking = createRanking(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData);
+        
+        // Generate closed issues participation rankings
+        console.log("🔍 Generating closed issues participation rankings...");
+        const closedIssuesParticipation = await aggregateClosedIssueParticipation(repoOwner, repositories, startDate, endDate);
+        
+        // Create separate closed issues rankings for QA and Dev
+        const closedIssuesData = Object.entries(closedIssuesParticipation)
+            .map(([author, participationCount]) => ({
+                author,
+                participation: participationCount
+            }))
+            .sort((a, b) => b.participation - a.participation);
+            
+        const closedIssuesQAData = closedIssuesData.filter(item => isQAUser(item.author));
+        const closedIssuesDevData = closedIssuesData.filter(item => !isQAUser(item.author));
+        
+        // Create rankings with totalIndex based on participation ranking position
+        closedIssuesQARanking = closedIssuesQAData.map((item, index) => ({
+            user: item.author,
+            totalIndex: index,
+            participation: item.participation
+        }));
+        
+        closedIssuesDevRanking = closedIssuesDevData.map((item, index) => ({
+            user: item.author,
+            totalIndex: index,
+            participation: item.participation
+        }));
 
         // Keep original aggregated ranking for backward compatibility
         const aggregateRanking = (): RankedUser[] => {
@@ -893,6 +1126,24 @@ export async function generateReport(
                     i < rejections.length ? `${rejections[i].rejections}` : "",
                 ]);
             }
+            return sheetData;
+        };
+
+        // Helper function to generate closed issues sheet data
+        const generateClosedIssuesSheetData = (closedIssuesRanking: ClosedIssueRankedUser[]) => {
+            const sheetData: any[] = [];
+            sheetData.push([
+                "User", "Closed Issues Participation"
+            ]);
+            
+            for(let i = 0; i < closedIssuesRanking.length; i++) {
+                const user = closedIssuesRanking[i];
+                sheetData.push([
+                    `${i + 1}.  ${user.user}`,
+                    user.participation || 0
+                ]);
+            }
+            
             return sheetData;
         };
 
@@ -941,6 +1192,24 @@ export async function generateReport(
             {wch: 15}, // Nr of Prs Rejected
         ];
         xlsx.utils.book_append_sheet(workbook, devWorksheet, `${periodName} - Dev Team`);
+        
+        // Generate Closed Issues QA ranking sheet
+        const closedIssuesQASheetData = generateClosedIssuesSheetData(closedIssuesQARanking);
+        const closedIssuesQAWorksheet = xlsx.utils.aoa_to_sheet(closedIssuesQASheetData);
+        closedIssuesQAWorksheet['!cols'] = [
+            {wch: 25}, // QA User
+            {wch: 20}, // Closed Issues Participation
+        ];
+        xlsx.utils.book_append_sheet(workbook, closedIssuesQAWorksheet, `${periodName} - QA Issues`);
+        
+        // Generate Closed Issues Dev ranking sheet
+        const closedIssuesDevSheetData = generateClosedIssuesSheetData(closedIssuesDevRanking);
+        const closedIssuesDevWorksheet = xlsx.utils.aoa_to_sheet(closedIssuesDevSheetData);
+        closedIssuesDevWorksheet['!cols'] = [
+            {wch: 25}, // Dev User
+            {wch: 20}, // Closed Issues Participation
+        ];
+        xlsx.utils.book_append_sheet(workbook, closedIssuesDevWorksheet, `${periodName} - Dev Issues`);
     }
 
         // Generate the labels report
@@ -950,7 +1219,7 @@ export async function generateReport(
         
         // Send the reports via email
     const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
-        await sendEmailWithAttachments(attachment, rankedUsers, qaRanking, devRanking, labelsReportPath);
+        await sendEmailWithAttachments(attachment, rankedUsers, qaRanking, devRanking, closedIssuesQARanking, closedIssuesDevRanking, labelsReportPath);
         
     } catch (error) {
         console.error("❌ Error generating report:", error);
