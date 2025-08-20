@@ -152,10 +152,46 @@ export interface RestIssue {
     state: string;
     created_at: string;
     closed_at: string;
+    assignees?: {
+        login: string;
+    }[];
+    assignee?: {
+        login: string;
+    } | null;
     labels: {
         name: string;
         color: string;
     }[];
+}
+
+export interface ClosedIssue extends RestIssue {
+    state: 'closed';
+    closed_at: string;
+}
+
+export interface IssueComment {
+    user: {
+        login: string;
+    };
+    created_at: string;
+    body: string;
+}
+
+export interface IssueParticipation {
+    issueNumber: number;
+    repository: string;
+    assignees: string[];
+    commenters: string[];
+    prMentioners: string[];
+}
+
+export interface RankedUser {
+    user: string;
+    totalIndex: number;
+}
+
+export interface ClosedIssueRankedUser extends RankedUser {
+    participation?: number;
 }
 
 export interface IssueEvent {
