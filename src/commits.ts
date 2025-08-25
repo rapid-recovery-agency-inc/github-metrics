@@ -2,7 +2,7 @@ import {AggregateCommits, GraphQLCommit, GraphQLCommitsResponse} from "./types";
 import {sleep, retryWithBackoff} from "./utils";
 import {COMMITS_CACHE} from "./cache";
 import fetch from "node-fetch";
-import { GITHUB_GRAPHQL_API} from "./constants";
+import { GITHUB_GRAPHQL_API, EXCLUDED_FROM_RANKINGS} from "./constants";
 
 const COMMITS_QUERY = `
     query($repoOwner: String!, $repository:String!, $since: GitTimestamp, $until: GitTimestamp, $cursor: String) {
@@ -150,6 +150,12 @@ export const aggregateCommits = (commits: GraphQLCommit[]): Record<string, Aggre
         if (author === "Unknown" && commit.author) {
             author = commit.author.name ?? "Unknown";
         }
+        
+        // Skip excluded users from rankings  
+        if (EXCLUDED_FROM_RANKINGS.has(author.toLowerCase())) {
+            return;
+        }
+        
         const record: AggregateCommits = aggregate[author] ?? {
             additions: 0,
             deletions: 0,
