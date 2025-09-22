@@ -4,9 +4,12 @@
   "type": "module",
   "scripts": {
     "start": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/serve.ts",
-    "run": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run.ts ",
+    "run": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run.ts",
     "start:local": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/index.ts",
-    "migrate-cache": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run-migration.ts"
+    "migrate-cache": "node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run-migration.ts",
+    "offline-only": "GITHUB_OFFLINE_MODE=true SKIP_COMMITS=true node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run.ts",
+    "force-refresh": "GITHUB_FORCE_REFRESH=true node --experimental-specifier-resolution=node --loader ts-node/esm ./src/run.ts",
+    "clear-cache": "rm -rf disk-cache/*.json disk-cache/*.db*"
   },
   "engines": {
     "node": ">=20"

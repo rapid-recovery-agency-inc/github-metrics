@@ -90,6 +90,17 @@ const fetchCommits = async (
                     }
                 }
                 
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`HTTP ${response.status}: ${errorText}`);
+                }
+                
+                const contentType = response.headers.get("content-type");
+                if (!contentType || !contentType.includes("application/json")) {
+                    const errorText = await response.text();
+                    throw new Error(`Expected JSON response, got ${contentType}: ${errorText.substring(0, 200)}`);
+                }
+                
                 return await response.json() as GraphQLCommitsResponse;
             }, 5, 3000, `fetchCommits(${repository})`);
             if (result.errors) {
@@ -124,10 +135,23 @@ export const fetchCommitsInDateRange = async (
     endDate: Date
 ): Promise<GraphQLCommit[]> => {
     const allCommits: GraphQLCommit[] = [];
+    let failedRepos = 0;
+    
     for (const repository of repositories) {
-        const commits = await fetchCommits(repoOwner, repository, startDate.toISOString(), endDate.toISOString());
-        allCommits.push(...commits);
+        try {
+            const commits = await fetchCommits(repoOwner, repository, startDate.toISOString(), endDate.toISOString());
+            allCommits.push(...commits);
+        } catch (error) {
+            console.error(`❌ Failed to fetch commits from ${repository}:`, error instanceof Error ? error.message : String(error));
+            failedRepos++;
+            // Continue with other repositories
+        }
     }
+    
+    if (failedRepos > 0) {
+        console.log(`⚠️  ${failedRepos} repositories failed during commit fetching, continuing with available data...`);
+    }
+    
     const deduplicatedCommitsMap = new Map<string, GraphQLCommit>();
     allCommits.forEach((commit) => {
         deduplicatedCommitsMap.set(commit.oid, commit);

@@ -10,11 +10,15 @@ if (!process.env.GITHUB_TOKEN || !process.env.GITHUB_ORG) {
 const repoOwner = `${process.env.GITHUB_ORG}`;
 console.log(`📊 Generating report for organization: ${repoOwner}`);
 
-try {
-    await generateReport(repoOwner);
-    console.log("✅ Report generation completed successfully!");
-} catch (error) {
-    console.error("❌ Error generating report:", error);
-    console.error("Stack trace:", error instanceof Error ? error.stack : "Unknown error");
-    process.exit(1);
+async function main() {
+    try {
+        await generateReport(repoOwner);
+        console.log("✅ Report generation completed successfully!");
+    } catch (error) {
+        console.error("❌ Error generating report:", error);
+        console.error("Stack trace:", error instanceof Error ? error.stack : "Unknown error");
+        process.exit(1);
+    }
 }
+
+main();
