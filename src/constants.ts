@@ -30,7 +30,7 @@ export const CACHE_CONFIG = {
 };
 export const BLACKLISTED_CODE_USERS = new Set<string>([
     "waqas", "fullstack900", "ghost", "dependabot[bot]", "unknown", "kaikrmen", "metalmagno", "aovallegalan",
-    "shedeed1","snyk-bot", "amlingad", "brennenhamilton", "copilot-pull-request-reviewer"]);
+    "shedeed1","snyk-bot", "amlingad", "brennenhamilton", "copilot-pull-request-reviewer", "david osorio", "joabcastillo"]);
 
 // Users excluded from all contributor rankings (system accounts and non-evaluatable users)
 export const EXCLUDED_FROM_RANKINGS = new Set<string>([
@@ -43,7 +43,10 @@ export const EXCLUDED_FROM_RANKINGS = new Set<string>([
     "copilot-swe-agent",
     "andresviviani1",
     "itensek-margins",
-    "tnezic-margins"
+    "tnezic-margins",
+    "david osorio",
+    "joabcastillo",
+    "dantoniazzo-margins"
 
 ]);
 
@@ -65,13 +68,20 @@ export const EXCLUDED_FROM_CLOSED_ISSUES = new Set<string>([
     "devgaurangdevmurari",
     "dhavalpkakadiya",
     "elm4rc0",
-    "dfmmalaw"
+    "dfmmalaw",
+    "david osorio",
+    "joabcastillo"
 ]);
 
 // Users excluded specifically from dev ranking
 export const EXCLUDED_FROM_DEV_RANKING = new Set<string>([
     "itensek-margins",
-    "tnezic-margins"
+    "tnezic-margins",
+    "david osorio",
+    "joabcastillo",
+    "dvancel",
+    "faiz-gap",
+    "dantoniazzo-margins"
 ]);
 
 // QA team users (quality assurance engineers)
@@ -82,6 +92,38 @@ export const QA_USERS = new Set<string>([
     "altaciosthedev",
     "anjelysleal"
 ]);
+
+// Expected QA users that should always appear in reports
+export const EXPECTED_QA_USERS = [
+    "augustoaf13",
+    "nicolas-toledo", 
+    "anjelysleal",
+    "altaciosthedev",
+    "juansebasmarin"
+];
+
+// Expected Dev users that should always appear in reports
+export const EXPECTED_DEV_USERS = [
+    "mneto12",
+    "jesusrodrz",
+    "osorio95",
+    "nodejose",
+    "franciscomaneiro",
+    "samuels2018",
+    "alacret",
+    "jonmiles",
+    "leonellima",
+    "manuelp1345",
+    "rojolelo",
+    "luisleopardi",
+    "ragomez33",
+    "eliman-c5",
+    "jean-yusss",
+    "moisesarvelo",
+    "shqmv",
+    "insighttful",
+    "elgeokareem"
+];
 
 // Function to determine if a user is QA (case-insensitive)
 export const isQAUser = (username: string): boolean => {

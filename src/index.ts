@@ -22,7 +22,7 @@ import {
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
 import {PRS_CACHE, PRS_REVIEW_CACHE, ISSUES_CACHE, ISSUE_EVENTS_CACHE, cleanupAllCaches, closeAllCaches} from "./cache.js";
-import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API, EXCLUDED_FROM_RANKINGS, EXCLUDED_FROM_CLOSED_ISSUES, EXCLUDED_FROM_DEV_RANKING, isQAUser, CACHE_TTL_SECONDS, CACHE_TTL_HOURS, USE_OFFLINE_MODE, FORCE_REFRESH_MODE, SKIP_COMMITS, CACHE_CONFIG} from "./constants";
+import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API, EXCLUDED_FROM_RANKINGS, EXCLUDED_FROM_CLOSED_ISSUES, EXCLUDED_FROM_DEV_RANKING, isQAUser, CACHE_TTL_SECONDS, CACHE_TTL_HOURS, USE_OFFLINE_MODE, FORCE_REFRESH_MODE, SKIP_COMMITS, CACHE_CONFIG, EXPECTED_QA_USERS, EXPECTED_DEV_USERS} from "./constants";
 import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
 import {debugToFile} from "./debug";
 import {fetchRepositories} from "./repositories";
@@ -680,6 +680,7 @@ async function aggregateClosedIssueParticipation(
             const normalizedUser = user.toLowerCase();
             // Skip excluded users from general rankings
             if (EXCLUDED_FROM_RANKINGS.has(normalizedUser)) {
+                console.log(`🚫 Excluding user from closed issues: ${normalizedUser}`);
                 return;
             }
             // Skip excluded users from closed issues rankings
@@ -916,6 +917,7 @@ const aggregateMetricsByDateRange = async (
             return;
         }
         if (EXCLUDED_FROM_RANKINGS.has(normalizedAuthor)) { // Exclude users from rankings (system accounts, etc.)
+            console.log(`🚫 Excluding user from rankings: ${normalizedAuthor}`);
             return;
         }
         const aliasAuthor = AUTHOR_ALIAS_MAP.get(normalizedAuthor);
@@ -944,9 +946,51 @@ const aggregateMetricsByDateRange = async (
     return mergedUserMetrics;
 }
 
+// Function to ensure all expected users appear in metrics, even with 0 values
+function ensureAllExpectedUsers(
+    metrics: Record<string, AggregateMetrics>, 
+    closedIssuesParticipation: Record<string, number>
+): { 
+    metrics: Record<string, AggregateMetrics>, 
+    closedIssuesParticipation: Record<string, number> 
+} {
+    const defaultMetrics: AggregateMetrics = {
+        commits: 0,
+        pullRequests: 0,
+        reviews: 0,
+        rejections: 0,
+        score: 0,
+        bugLabels: 0,
+        enhancementLabels: 0,
+        otherLabels: 0,
+    };
+
+    // Ensure all expected QA users are present
+    EXPECTED_QA_USERS.forEach(user => {
+        if (!metrics[user]) {
+            metrics[user] = { ...defaultMetrics };
+        }
+        if (!(user in closedIssuesParticipation)) {
+            closedIssuesParticipation[user] = 0;
+        }
+    });
+
+    // Ensure all expected Dev users are present
+    EXPECTED_DEV_USERS.forEach(user => {
+        if (!metrics[user]) {
+            metrics[user] = { ...defaultMetrics };
+        }
+        if (!(user in closedIssuesParticipation)) {
+            closedIssuesParticipation[user] = 0;
+        }
+    });
+
+    return { metrics, closedIssuesParticipation };
+}
+
 // Function to send an email with the reports attached
 async function sendEmailWithAttachments(
-    attachment: Buffer, 
+    _unused: any, 
     qaRanking: RankedUser[], 
     devRanking: RankedUser[], 
     closedIssuesQARanking: ClosedIssueRankedUser[],
@@ -955,11 +999,13 @@ async function sendEmailWithAttachments(
 ) {
     
     const qaRankedListString = qaRanking.map((rank, index) => {
-        return `${index + 1}.  ${rank.user} <br/>`;
+        const position = rank.finalRank || (index + 1);
+        return `${position}.  ${rank.user} <br/>`;
     }).join('\n');
     
     const devRankedListString = devRanking.map((rank, index) => {
-        return `${index + 1}.  ${rank.user} <br/>`;
+        const position = rank.finalRank || (index + 1);
+        return `${position}.  ${rank.user} <br/>`;
     }).join('\n');
     
     const closedIssuesQARankedListString = closedIssuesQARanking.map((rank, index) => {
@@ -973,7 +1019,7 @@ async function sendEmailWithAttachments(
     const attachments = [
         {
             filename: FILE_PATH,
-            path: FILE_PATH,
+            path: `./${FILE_PATH}`,
         }
     ];
     
@@ -981,18 +1027,17 @@ async function sendEmailWithAttachments(
     if (labelsReportPath) {
         attachments.push({
             filename: LABELS_FILE_PATH,
-            path: labelsReportPath,
+            path: `./${labelsReportPath}`,
         });
     }
     
     await sendTemplateEmail({
         users: [
-            {email: 'estebanpersonal20@gmail.com'},
-            // {email: 'ezabala@insightt.io'},
-            // {email: 'alacret@insightt.io'},
-            // {email: 'ysouki@insightt.io'},
-            // {email: 'ezabala@insightt.io'},
-            // {email: 'lpena@insightt.io'}
+            {email: 'ezabala@insightt.io'},
+            {email: 'alacret@insightt.io'},
+            {email: 'ysouki@insightt.io'},
+            {email: 'ezabala@insightt.io'},
+            {email: 'lpena@insightt.io'}
         ],
         subject: "GitHub Metrics Report",
         body: `
@@ -1228,7 +1273,7 @@ export async function generateReport(
         // Reset error statistics for this report generation
         errorStats.resetStats();
         
-        const repositories = await fetchRepositories(repoOwner);
+    const repositories = await fetchRepositories(repoOwner);
         
         // Cleanup expired cache entries
         await cleanupAllCaches();
@@ -1260,11 +1305,66 @@ export async function generateReport(
             console.log(`⚠️ No cached data found - will need to fetch from API`);
         }
 
+    // Use only the longest period (12 weeks) for final rankings instead of incorrectly accumulating all periods
+    let finalMetrics: Record<string, AggregateMetrics> = {};
+
     for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
         const startDate = new Date();
         startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
         const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
-        const commitsData = Object.entries(report)
+        
+        // Generate closed issues participation rankings for this specific period
+        console.log(`🔍 Generating closed issues participation for ${periodName}...`);
+        let closedIssuesParticipation = await aggregateClosedIssueParticipation(repoOwner, repositories, startDate, endDate);
+        
+        // Ensure all expected users appear in the data, even with 0 values
+        const ensuredData = ensureAllExpectedUsers({ ...report }, { ...closedIssuesParticipation });
+        const ensuredReport = ensuredData.metrics;
+        closedIssuesParticipation = ensuredData.closedIssuesParticipation;
+        
+        // Store the longest period (12 weeks) data for final rankings
+        if (Number(weeksAgo) === 12) {
+            finalMetrics = { ...ensuredReport };
+            console.log(`📊 Using 12-week period data for final rankings (${Object.keys(finalMetrics).length} users)`);
+        }
+        
+        // Create separate closed issues rankings for QA and Dev for this period
+        const closedIssuesData = Object.entries(closedIssuesParticipation)
+            .map(([author, participationCount]) => ({
+                author,
+                participation: participationCount
+            }))
+            .sort((a, b) => b.participation - a.participation);
+            
+        console.log(`📊 ${periodName} - Total closed issues participants: ${closedIssuesData.length}`);
+        
+        const closedIssuesQAData = closedIssuesData.filter(item => isQAUser(item.author));
+        const closedIssuesDevData = closedIssuesData.filter(item => !isQAUser(item.author) && !EXCLUDED_FROM_DEV_RANKING.has(item.author.toLowerCase()));
+        
+        console.log(`👥 ${periodName} - QA closed issues participants: ${closedIssuesQAData.length}`);
+        console.log(`💻 ${periodName} - Dev closed issues participants: ${closedIssuesDevData.length}`);
+        
+        // Create rankings with totalIndex based on participation ranking position for this period
+        const periodClosedIssuesQARanking = closedIssuesQAData.map((item, index) => ({
+            user: item.author,
+            totalIndex: index,
+            participation: item.participation
+        }));
+        
+        const periodClosedIssuesDevRanking = closedIssuesDevData.map((item, index) => ({
+            user: item.author,
+            totalIndex: index,
+            participation: item.participation
+        }));
+        
+        // Store the 12-week period data for final rankings (used in email)
+        if (Number(weeksAgo) === 12) {
+            closedIssuesQARanking = periodClosedIssuesQARanking;
+            closedIssuesDevRanking = periodClosedIssuesDevRanking;
+        }
+        
+        // Generate individual period data for Excel sheets
+        const commitsData = Object.entries(ensuredReport)
             .map((item: any) => {
                 return {
                     author: String(item[0]).toLowerCase(),
@@ -1272,7 +1372,7 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.commits - a.commits);
-        const mergedPrsData = Object.entries(report)
+        const mergedPrsData = Object.entries(ensuredReport)
             .map((item: any) => {
                 return {
                     author: String(item[0]).toLowerCase(),
@@ -1280,7 +1380,7 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.pullRequests - a.pullRequests);
-        const prsReviewsData = Object.entries(report)
+        const prsReviewsData = Object.entries(ensuredReport)
             .map((item: any) => {
                 return {
                     author: String(item[0]).toLowerCase(),
@@ -1288,7 +1388,7 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.score - a.score);
-            const prsRejectionsData = Object.entries(report)
+            const prsRejectionsData = Object.entries(ensuredReport)
                 .map((item: any) => {
                     return {
                         author: String(item[0]).toLowerCase(),
@@ -1298,7 +1398,7 @@ export async function generateReport(
                 .sort((a, b) => a.rejections - b.rejections); // Ascendente: menos rechazos = mejor posición
 
         //Create a function to calculate the aggregate ranking
-        // Helper function to filter data by user type
+        // Helper function to filter data by user type (for individual period sheets)
         const filterDataByUserType = (data: any[], isQA: boolean) => {
             return data.filter(item => {
                 const isUserQA = isQAUser(item.author);
@@ -1314,7 +1414,7 @@ export async function generateReport(
         };
         
 
-        // Create separate datasets for QA and Dev users
+        // Create separate datasets for QA and Dev users (for individual period sheets)
         const qaCommitsData = filterDataByUserType(commitsData, true);
         const qaMultipliedPrsData = filterDataByUserType(mergedPrsData, true);
         const qaPrsReviewsData = filterDataByUserType(prsReviewsData, true);
@@ -1324,150 +1424,7 @@ export async function generateReport(
         const devMergedPrsData = filterDataByUserType(mergedPrsData, false);
         const devPrsReviewsData = filterDataByUserType(prsReviewsData, false);
         const devPrsRejectionsData = filterDataByUserType(prsRejectionsData, false);
-
-        // Helper function to calculate positions with proper tie handling
-        const calculatePositionsWithTies = (array: any[], valueKey: string): Map<string, number> => {
-            const positions = new Map<string, number>();
-            
-            // Group users by their values
-            const valueGroups = new Map<any, string[]>();
-            array.forEach(item => {
-                const value = item[valueKey];
-                if (!valueGroups.has(value)) {
-                    valueGroups.set(value, []);
-                }
-                valueGroups.get(value)!.push(item.author);
-            });
-            
-            // Sort values to assign positions correctly
-            const sortedValues = Array.from(valueGroups.keys()).sort((a, b) => {
-                // For rejections, lower is better (ascending)
-                if (valueKey === 'rejections') return a - b;
-                // For others, higher is better (descending)  
-                return b - a;
-            });
-            
-            let currentPosition = 1; // Start at position 1, not 0
-            sortedValues.forEach(value => {
-                const usersWithThisValue = valueGroups.get(value)!;
-                // All users with same value get the SAME position (this fixes the tie issue)
-                usersWithThisValue.forEach(user => {
-                    positions.set(user, currentPosition);
-                });
-                // Next position is just the next consecutive number (not jumping)
-                // Example: 5 users at position 1, next user gets position 2 (consecutive)
-                currentPosition += 1;
-            });
-            
-            return positions;
-        };
-
-        // Generic ranking function with proper tie handling
-        const createRanking = (commits: any[], prs: any[], reviews: any[], rejections: any[]): RankedUser[] => {
-            const rankingMap: { [key: string]: number } = {};
-
-            // Calculate positions for each metric with tie handling
-            const commitPositions = calculatePositionsWithTies(commits, 'commits');
-            const prPositions = calculatePositionsWithTies(prs, 'pullRequests');  
-            const reviewPositions = calculatePositionsWithTies(reviews, 'score');
-            const rejectionPositions = calculatePositionsWithTies(rejections, 'rejections');
-
-            // Sum positions for each user
-            const allUsers = new Set([
-                ...commits.map(c => c.author),
-                ...prs.map(p => p.author),
-                ...reviews.map(r => r.author),
-                ...rejections.map(r => r.author)
-            ]);
-
-            allUsers.forEach(user => {
-                rankingMap[user] = 
-                    (commitPositions.get(user) || commits.length) +
-                    (prPositions.get(user) || prs.length) +
-                    (reviewPositions.get(user) || reviews.length) +
-                    (rejectionPositions.get(user) || rejections.length);
-            });
-
-            return Object.entries(rankingMap)
-                .map(([user, totalIndex]) => ({user, totalIndex}))
-                .sort((a, b) => a.totalIndex - b.totalIndex);
-        };
-
-        // Create separate rankings
-        qaRanking = createRanking(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData);
-        devRanking = createRanking(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData);
         
-        // Debug: Show alacret's individual positions
-        const alacretCommitPos = devCommitsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
-        const alacretPRPos = devMergedPrsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
-        const alacretReviewPos = devPrsReviewsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
-        const alacretRejectionPos = devPrsRejectionsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
-        
-        const alacretInDevRanking = devRanking.find(u => u.user.toLowerCase() === 'alacret');
-        const alacretFinalPos = devRanking.findIndex(u => u.user.toLowerCase() === 'alacret') + 1;
-        
-        // Store debug info to show at the end
-        debugInfo = {
-            commits: alacretCommitPos || 'Not found',
-            prs: alacretPRPos || 'Not found', 
-            reviews: alacretReviewPos || 'Not found',
-            rejections: alacretRejectionPos || 'Not found',
-            totalIndex: alacretInDevRanking?.totalIndex || 'Not found',
-            finalPosition: alacretFinalPos || 'Not found'
-        };
-
-        // Show ties verification for PR Rejections (most common ties)
-        console.log("\n🔍 TIES VERIFICATION - PR Rejections:");
-        console.log("=".repeat(50));
-        const rejectionGroups = new Map<number, string[]>();
-        devPrsRejectionsData.forEach((user: any) => {
-            const rejections = user.rejections;
-            if (!rejectionGroups.has(rejections)) {
-                rejectionGroups.set(rejections, []);
-            }
-            rejectionGroups.get(rejections)!.push(user.author);
-        });
-        
-        const rejectionPositions = calculatePositionsWithTies(devPrsRejectionsData, 'rejections');
-        const sortedRejectionValues = Array.from(rejectionGroups.keys()).sort((a, b) => a - b);
-        
-        sortedRejectionValues.forEach(rejectionCount => {
-            const usersWithThisValue = rejectionGroups.get(rejectionCount)!;
-            const position = rejectionPositions.get(usersWithThisValue[0]);
-            console.log(`${rejectionCount} rejections: ${usersWithThisValue.length} users at position #${position}`);
-            if (usersWithThisValue.length <= 5) {
-                console.log(`  Users: ${usersWithThisValue.join(', ')}`);
-            }
-        });
-        console.log("=".repeat(50));
-        
-        // Generate closed issues participation rankings
-        console.log("🔍 Generating closed issues participation rankings...");
-        const closedIssuesParticipation = await aggregateClosedIssueParticipation(repoOwner, repositories, startDate, endDate);
-        
-        // Create separate closed issues rankings for QA and Dev
-        const closedIssuesData = Object.entries(closedIssuesParticipation)
-            .map(([author, participationCount]) => ({
-                author,
-                participation: participationCount
-            }))
-            .sort((a, b) => b.participation - a.participation);
-            
-        const closedIssuesQAData = closedIssuesData.filter(item => isQAUser(item.author));
-        const closedIssuesDevData = closedIssuesData.filter(item => !isQAUser(item.author));
-        
-        // Create rankings with totalIndex based on participation ranking position
-        closedIssuesQARanking = closedIssuesQAData.map((item, index) => ({
-            user: item.author,
-            totalIndex: index,
-            participation: item.participation
-        }));
-        
-        closedIssuesDevRanking = closedIssuesDevData.map((item, index) => ({
-            user: item.author,
-            totalIndex: index,
-            participation: item.participation
-        }));
         
 
         // Helper function to generate sheet data (keeping original structure, adding closed issues at the end)
@@ -1479,7 +1436,7 @@ export async function generateReport(
             "Commit's Users", "Changes: additions + deletions", 
             "Merged PRS", "No of Merged PRS", 
             "PRS Reviews", "No of PRS Reviews",
-            "Prs Rejected", "Nr of Prs Rejected"
+                "Prs Rejected", "Nr of Prs Rejected"
         ];
         
         if (closedIssues && closedIssues.length > 0) {
@@ -1488,17 +1445,17 @@ export async function generateReport(
         
         sheetData.push(headers);
         
-        const maxRows = Math.max(commits.length, prs.length, reviews.length, rejections.length);
+            const maxRows = Math.max(commits.length, prs.length, reviews.length, rejections.length);
         for(let i = 0; i < maxRows; i++) {
             const row = [
-                i < commits.length ? `${i + 1}.  ${commits[i].author}` : "",
-                i < commits.length ? `${commits[i].commits}` : "",
-                i < prs.length ? `${i + 1}.  ${prs[i].author}` : "",
-                i < prs.length ? `${prs[i].pullRequests}` : "",
-                i < reviews.length ? `${i + 1}.  ${reviews[i].author}` : "",
-                i < reviews.length ? `${parseFloat(reviews[i].score.toFixed(1))}` : "",
-                i < rejections.length ? `${i + 1}.  ${rejections[i].author}` : "",
-                i < rejections.length ? `${rejections[i].rejections}` : "",
+                    i < commits.length ? `${i + 1}.  ${commits[i].author}` : "",
+                    i < commits.length ? `${commits[i].commits}` : "",
+                    i < prs.length ? `${i + 1}.  ${prs[i].author}` : "",
+                    i < prs.length ? `${prs[i].pullRequests}` : "",
+                    i < reviews.length ? `${i + 1}.  ${reviews[i].author}` : "",
+                    i < reviews.length ? `${parseFloat(reviews[i].score.toFixed(1))}` : "",
+                    i < rejections.length ? `${i + 1}.  ${rejections[i].author}` : "",
+                    i < rejections.length ? `${rejections[i].rejections}` : "",
             ];
             
             // Add closed issues columns only if data is provided
@@ -1511,13 +1468,27 @@ export async function generateReport(
             
             sheetData.push(row);
         }
-        return sheetData;
+        
+        console.log(`🔍 DEBUG - Generated sheet data: ${sheetData.length} rows (including header)`);
+        if (sheetData.length > 1) {
+            console.log(`📋 Sample row:`, sheetData[1]);
+            }
+            
+            return sheetData;
         };
 
 
         
         // Generate QA team ranking sheet (consolidated with closed issues)
-        const qaSheetData = generateSheetData(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData, closedIssuesQARanking);
+        console.log(`📊 Generating QA sheet with ${periodClosedIssuesQARanking.length} closed issues participants`);
+        console.log(`🔍 DEBUG - QA Data Arrays Length:`, {
+            commits: qaCommitsData.length,
+            prs: qaMultipliedPrsData.length,
+            reviews: qaPrsReviewsData.length,
+            rejections: qaPrsRejectionsData.length,
+            closedIssues: periodClosedIssuesQARanking.length
+        });
+        const qaSheetData = generateSheetData(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData, periodClosedIssuesQARanking);
         const qaWorksheet = xlsx.utils.aoa_to_sheet(qaSheetData);
         const qaColumnWidths = [
             {wch: 20}, // Commit's Users
@@ -1531,7 +1502,7 @@ export async function generateReport(
         ];
         
         // Add closed issues column widths if we have QA closed issues data
-        if (closedIssuesQARanking && closedIssuesQARanking.length > 0) {
+        if (periodClosedIssuesQARanking && periodClosedIssuesQARanking.length > 0) {
             qaColumnWidths.push(
                 {wch: 25}, // Closed Issues Participation
                 {wch: 15}  // Nr of Closed Issues
@@ -1542,7 +1513,15 @@ export async function generateReport(
         xlsx.utils.book_append_sheet(workbook, qaWorksheet, `${periodName} - QA Team`);
         
         // Generate Dev team ranking sheet (consolidated with closed issues)
-        const devSheetData = generateSheetData(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData, closedIssuesDevRanking);
+        console.log(`📊 Generating Dev sheet with ${periodClosedIssuesDevRanking.length} closed issues participants`);
+        console.log(`🔍 DEBUG - Dev Data Arrays Length:`, {
+            commits: devCommitsData.length,
+            prs: devMergedPrsData.length,
+            reviews: devPrsReviewsData.length,
+            rejections: devPrsRejectionsData.length,
+            closedIssues: periodClosedIssuesDevRanking.length
+        });
+        const devSheetData = generateSheetData(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData, periodClosedIssuesDevRanking);
         const devWorksheet = xlsx.utils.aoa_to_sheet(devSheetData);
         const devColumnWidths = [
             {wch: 20}, // Commit's Users
@@ -1556,7 +1535,7 @@ export async function generateReport(
         ];
         
         // Add closed issues column widths if we have Dev closed issues data
-        if (closedIssuesDevRanking && closedIssuesDevRanking.length > 0) {
+        if (periodClosedIssuesDevRanking && periodClosedIssuesDevRanking.length > 0) {
             devColumnWidths.push(
                 {wch: 25}, // Closed Issues Participation
                 {wch: 15}  // Nr of Closed Issues
@@ -1566,40 +1545,338 @@ export async function generateReport(
         devWorksheet['!cols'] = devColumnWidths;
         xlsx.utils.book_append_sheet(workbook, devWorksheet, `${periodName} - Dev Team`);
     }
+    
+    // After processing all periods, calculate final rankings using 12-week data
+    console.log("🏆 Calculating final rankings using 12-week period data...");
+    
+    // Create final data arrays for ranking calculations
+    const finalCommitsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            commits: metrics.commits,
+        }))
+        .sort((a, b) => b.commits - a.commits);
+        
+    const finalMergedPrsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            pullRequests: metrics.pullRequests,
+        }))
+        .sort((a, b) => b.pullRequests - a.pullRequests);
+        
+    const finalPrsReviewsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            score: metrics.score,
+        }))
+        .sort((a, b) => b.score - a.score);
+        
+    const finalPrsRejectionsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            rejections: metrics.rejections,
+        }))
+        .sort((a, b) => a.rejections - b.rejections);
+
+    // Helper function to filter final data by user type
+    const filterFinalDataByUserType = (data: any[], isQA: boolean) => {
+        return data.filter(item => {
+            const isUserQA = isQAUser(item.author);
+            // If we want QA users, return QA users
+            if (isQA) {
+                return isUserQA;
+            }
+            // If we want Dev users, exclude QA users AND specifically excluded dev users
+            else {
+                return !isUserQA && !EXCLUDED_FROM_DEV_RANKING.has(item.author.toLowerCase());
+            }
+        });
+    };
+
+    // Create separate final datasets for QA and Dev users
+    const qaFinalCommitsData = filterFinalDataByUserType(finalCommitsData, true);
+    const qaFinalPrsData = filterFinalDataByUserType(finalMergedPrsData, true);
+    const qaFinalReviewsData = filterFinalDataByUserType(finalPrsReviewsData, true);
+    const qaFinalRejectionsData = filterFinalDataByUserType(finalPrsRejectionsData, true);
+
+    const devFinalCommitsData = filterFinalDataByUserType(finalCommitsData, false);
+    const devFinalPrsData = filterFinalDataByUserType(finalMergedPrsData, false);
+    const devFinalReviewsData = filterFinalDataByUserType(finalPrsReviewsData, false);
+    const devFinalRejectionsData = filterFinalDataByUserType(finalPrsRejectionsData, false);
+
+    // Helper function to calculate positions with proper tie handling
+    const calculatePositionsWithTies = (array: any[], valueKey: string): Map<string, number> => {
+        const positions = new Map<string, number>();
+        
+        // Group users by their values
+        const valueGroups = new Map<any, string[]>();
+        array.forEach(item => {
+            const value = item[valueKey];
+            if (!valueGroups.has(value)) {
+                valueGroups.set(value, []);
+            }
+            valueGroups.get(value)!.push(item.author);
+        });
+        
+        // Sort values to assign positions correctly
+        const sortedValues = Array.from(valueGroups.keys()).sort((a, b) => {
+            // For rejections, lower is better (ascending)
+            if (valueKey === 'rejections') return a - b;
+            // For others, higher is better (descending)  
+            return b - a;
+        });
+        
+        let currentPosition = 1; // Start at position 1, not 0
+        sortedValues.forEach(value => {
+            const usersWithThisValue = valueGroups.get(value)!;
+            // All users with same value get the SAME position (this fixes the tie issue)
+            usersWithThisValue.forEach(user => {
+                positions.set(user, currentPosition);
+            });
+            // Next position is just the next consecutive number (not jumping)
+            // Example: 5 users at position 1, next user gets position 2 (consecutive)
+            currentPosition += 1;
+        });
+        
+        return positions;
+    };
+
+    // Generic ranking function with proper tie handling and tiebreakers
+    const createRanking = (commits: any[], prs: any[], reviews: any[], rejections: any[]): RankedUser[] => {
+        const rankingMap: { [key: string]: number } = {};
+
+        // Calculate positions for each metric with tie handling
+        const commitPositions = calculatePositionsWithTies(commits, 'commits');
+        const prPositions = calculatePositionsWithTies(prs, 'pullRequests');  
+        const reviewPositions = calculatePositionsWithTies(reviews, 'score');
+        const rejectionPositions = calculatePositionsWithTies(rejections, 'rejections');
+
+        // Create maps to get raw values for tiebreakers
+        const commitValues = new Map<string, number>();
+        const rejectionValues = new Map<string, number>();
+        
+        commits.forEach(c => commitValues.set(c.author, c.commits));
+        rejections.forEach(r => rejectionValues.set(r.author, r.rejections));
+
+        // Sum positions for each user
+        const allUsers = new Set([
+            ...commits.map(c => c.author),
+            ...prs.map(p => p.author),
+            ...reviews.map(r => r.author),
+            ...rejections.map(r => r.author)
+        ]);
+
+        allUsers.forEach(user => {
+            rankingMap[user] = 
+                (commitPositions.get(user) || commits.length + 1) +
+                (prPositions.get(user) || prs.length + 1) +
+                (reviewPositions.get(user) || reviews.length + 1) +
+                (rejectionPositions.get(user) || rejections.length + 1);
+        });
+
+        // Sort users by totalIndex with tiebreakers
+        const sortedUsers = Object.entries(rankingMap)
+            .map(([user, totalIndex]) => ({
+                user, 
+                totalIndex,
+                rejections: rejectionValues.get(user) || 0,
+                commits: commitValues.get(user) || 0
+            }))
+            .sort((a, b) => {
+                // Primary sort: by totalIndex (ascending - lower is better)
+                if (a.totalIndex !== b.totalIndex) {
+                    return a.totalIndex - b.totalIndex;
+                }
+                
+                // Tiebreaker 1: by rejections (ascending - fewer rejections is better)
+                if (a.rejections !== b.rejections) {
+                    return a.rejections - b.rejections;
+                }
+                
+                // Tiebreaker 2: by commits (descending - more commits is better)
+                return b.commits - a.commits;
+            });
+            
+        // Assign final positions handling ties with tiebreakers
+        const finalRanking: RankedUser[] = [];
+        let currentRank = 1;
+        
+        // Track ties for logging
+        const tieGroups = new Map<string, any[]>();
+        
+        for (let i = 0; i < sortedUsers.length; i++) {
+            const currentUser = sortedUsers[i];
+            const prevUser = i > 0 ? sortedUsers[i - 1] : null;
+            
+            // Check if this user should get a new rank (not tied with previous)
+            const isNewRank = !prevUser || 
+                currentUser.totalIndex !== prevUser.totalIndex ||
+                currentUser.rejections !== prevUser.rejections ||
+                currentUser.commits !== prevUser.commits;
+            
+            if (isNewRank && i > 0) {
+                currentRank = i + 1;
+            }
+            
+            // Create a key for grouping truly tied users (same totalIndex, rejections, and commits)
+            const tieKey = `${currentUser.totalIndex}-${currentUser.rejections}-${currentUser.commits}`;
+            if (!tieGroups.has(tieKey)) {
+                tieGroups.set(tieKey, []);
+            }
+            tieGroups.get(tieKey)!.push({
+                user: currentUser.user,
+                totalIndex: currentUser.totalIndex,
+                rejections: currentUser.rejections,
+                commits: currentUser.commits,
+                finalRank: currentRank
+            });
+            
+            finalRanking.push({
+                user: currentUser.user,
+                totalIndex: currentUser.totalIndex,
+                finalRank: currentRank
+            });
+        }
+        
+        // Log ties and tiebreaker information
+        console.log("\n🏆 FINAL RANKING WITH TIEBREAKERS:");
+        console.log("=".repeat(60));
+        
+        // Group by totalIndex for cleaner display
+        const scoreGroups = new Map<number, any[]>();
+        finalRanking.forEach(user => {
+            const userData = sortedUsers.find(u => u.user === user.user)!;
+            if (!scoreGroups.has(user.totalIndex)) {
+                scoreGroups.set(user.totalIndex, []);
+            }
+            scoreGroups.get(user.totalIndex)!.push({
+                ...user,
+                rejections: userData.rejections,
+                commits: userData.commits
+            });
+        });
+        
+        const sortedScores = Array.from(scoreGroups.keys()).sort((a, b) => a - b);
+        sortedScores.forEach(totalIndex => {
+            const usersWithThisScore = scoreGroups.get(totalIndex)!;
+            console.log(`\n📊 Score ${totalIndex} points:`);
+            
+            if (usersWithThisScore.length === 1) {
+                const user = usersWithThisScore[0];
+                console.log(`   ${user.finalRank}. ${user.user} (${user.rejections} rejections, ${user.commits} commits)`);
+            } else {
+                // Show tiebreaker details
+                console.log(`   ${usersWithThisScore.length} users with ${totalIndex} points:`);
+                usersWithThisScore
+                    .sort((a, b) => a.finalRank - b.finalRank)
+                    .forEach(user => {
+                        console.log(`   ${user.finalRank}. ${user.user} (${user.rejections} rejections, ${user.commits} commits)`);
+                    });
+            }
+        });
+        console.log("=".repeat(60));
+        
+        return finalRanking;
+    };
+
+    // Create final rankings using 12-week data
+    qaRanking = createRanking(qaFinalCommitsData, qaFinalPrsData, qaFinalReviewsData, qaFinalRejectionsData);
+    devRanking = createRanking(devFinalCommitsData, devFinalPrsData, devFinalReviewsData, devFinalRejectionsData);
+    
+    // Debug: Show alacret's individual positions in final data
+    const alacretCommitPos = devFinalCommitsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    const alacretPRPos = devFinalPrsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    const alacretReviewPos = devFinalReviewsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    const alacretRejectionPos = devFinalRejectionsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    
+    const alacretInDevRanking = devRanking.find(u => u.user.toLowerCase() === 'alacret');
+    const alacretFinalPos = devRanking.findIndex(u => u.user.toLowerCase() === 'alacret') + 1;
+    
+    // Store debug info to show at the end
+    debugInfo = {
+        commits: alacretCommitPos || 'Not found',
+        prs: alacretPRPos || 'Not found', 
+        reviews: alacretReviewPos || 'Not found',
+        rejections: alacretRejectionPos || 'Not found',
+        totalIndex: alacretInDevRanking?.totalIndex || 'Not found',
+        finalPosition: alacretFinalPos || 'Not found'
+    };
+
+    // Show ties verification for PR Rejections (most common ties)
+    console.log("\n🔍 TIES VERIFICATION - PR Rejections (12-Week Data):");
+    console.log("=".repeat(50));
+    const rejectionGroups = new Map<number, string[]>();
+    devFinalRejectionsData.forEach((user: any) => {
+        const rejections = user.rejections;
+        if (!rejectionGroups.has(rejections)) {
+            rejectionGroups.set(rejections, []);
+        }
+        rejectionGroups.get(rejections)!.push(user.author);
+    });
+    
+    const rejectionPositions = calculatePositionsWithTies(devFinalRejectionsData, 'rejections');
+    const sortedRejectionValues = Array.from(rejectionGroups.keys()).sort((a, b) => a - b);
+    
+    sortedRejectionValues.forEach(rejectionCount => {
+        const usersWithThisValue = rejectionGroups.get(rejectionCount)!;
+        const position = rejectionPositions.get(usersWithThisValue[0]);
+        console.log(`${rejectionCount} rejections: ${usersWithThisValue.length} users at position #${position}`);
+        if (usersWithThisValue.length <= 5) {
+            console.log(`  Users: ${usersWithThisValue.join(', ')}`);
+        }
+    });
+    console.log("=".repeat(50));
+    
+    
+    console.log(`✅ Final rankings calculated using 12-week period data only`);
+    console.log(`📊 Final metrics for ${Object.keys(finalMetrics).length} users`);
 
         // Generate the labels report
         console.log("🏷️  Starting labels report generation...");
         const labelsReportPath = await generateLabelsReport(repoOwner);
         console.log("✅ Labels report generation completed!");
-        
-        // Show error handling statistics
-        if (errorStats.skippedPRs > 0 || errorStats.cachedFallbackPRs > 0) {
-            console.log(`\n📊 Error Handling Summary:`);
-            if (errorStats.cachedFallbackPRs > 0) {
-                console.log(`🔄 PRs recovered from cache: ${errorStats.cachedFallbackPRs}`);
-            }
-            if (errorStats.skippedPRs > 0) {
-                console.log(`⚠️ PRs skipped (no data): ${errorStats.skippedPRs}`);
-            }
-            console.log(`✅ Report completed despite ${errorStats.skippedPRs + errorStats.cachedFallbackPRs} PR issues\n`);
+    
+    // Show error handling statistics
+    if (errorStats.skippedPRs > 0 || errorStats.cachedFallbackPRs > 0) {
+        console.log(`\n📊 Error Handling Summary:`);
+        if (errorStats.cachedFallbackPRs > 0) {
+            console.log(`🔄 PRs recovered from cache: ${errorStats.cachedFallbackPRs}`);
         }
+        if (errorStats.skippedPRs > 0) {
+            console.log(`⚠️ PRs skipped (no data): ${errorStats.skippedPRs}`);
+        }
+        console.log(`✅ Report completed despite ${errorStats.skippedPRs + errorStats.cachedFallbackPRs} PR issues\n`);
+    }
 
-        // Show debug info at the end
-        console.log("\n" + "=".repeat(60));
-        console.log("🔍 DEBUG: alacret's positions in each Dev metric:");
-        console.log("=".repeat(60));
-        console.log(`- Commits: #${debugInfo.commits}`);
-        console.log(`- PRs Merged: #${debugInfo.prs}`);
-        console.log(`- PR Reviews: #${debugInfo.reviews}`);
-        console.log(`- PR Rejections: #${debugInfo.rejections}`);
-        console.log(`- Total Index Score: ${debugInfo.totalIndex}`);
-        console.log(`- Final Dev Ranking: #${debugInfo.finalPosition}`);
-        console.log("=".repeat(60));
+    // Show debug info at the end
+    console.log("\n" + "=".repeat(60));
+    console.log("🔍 DEBUG: alacret's positions in each Dev metric:");
+    console.log("=".repeat(60));
+    console.log(`- Commits: #${debugInfo.commits}`);
+    console.log(`- PRs Merged: #${debugInfo.prs}`);
+    console.log(`- PR Reviews: #${debugInfo.reviews}`);
+    console.log(`- PR Rejections: #${debugInfo.rejections}`);
+    console.log(`- Total Index Score: ${debugInfo.totalIndex}`);
+    console.log(`- Final Dev Ranking: #${debugInfo.finalPosition}`);
+    console.log("=".repeat(60));
         
-
         // Send the reports via email
-        const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
-        await sendEmailWithAttachments(attachment, qaRanking, devRanking, closedIssuesQARanking, closedIssuesDevRanking, labelsReportPath);
+    console.log("📧 Preparing to send email with both reports...");
+    // Save the Excel file to disk
+    xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
+    console.log(`📄 Excel file saved: ${FILE_PATH}`);
+    
+    // Verify files exist before sending email
+    const fs = await import('fs');
+    const mainFileExists = fs.existsSync(FILE_PATH);
+    const labelsFileExists = labelsReportPath ? fs.existsSync(labelsReportPath) : false;
+    console.log(`📋 File verification:`);
+    console.log(`   Main report (${FILE_PATH}): ${mainFileExists ? '✅ EXISTS' : '❌ MISSING'}`);
+    console.log(`   Labels report (${labelsReportPath}): ${labelsFileExists ? '✅ EXISTS' : '❌ MISSING'}`);
+    
+    // Send email with file paths (not buffer)
+    await sendEmailWithAttachments(undefined, qaRanking, devRanking, closedIssuesQARanking, closedIssuesDevRanking, labelsReportPath);
+    console.log("✅ Email sent successfully! Script should complete now.");
         
     } catch (error) {
         console.error("❌ Error generating report:", error);
