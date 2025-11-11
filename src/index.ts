@@ -22,7 +22,7 @@ import {
 } from "./types";
 import {sendTemplateEmail} from "./email.js";
 import {PRS_CACHE, PRS_REVIEW_CACHE, ISSUES_CACHE, ISSUE_EVENTS_CACHE, cleanupAllCaches, closeAllCaches} from "./cache.js";
-import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API, EXCLUDED_FROM_RANKINGS, isQAUser} from "./constants";
+import {AUTHOR_ALIAS_MAP, BLACKLISTED_CODE_USERS, DAYS_IN_INTERVAL, GITHUB_GRAPHQL_API, EXCLUDED_FROM_RANKINGS, EXCLUDED_FROM_CLOSED_ISSUES, EXCLUDED_FROM_DEV_RANKING, isQAUser, CACHE_TTL_SECONDS, CACHE_TTL_HOURS, USE_OFFLINE_MODE, FORCE_REFRESH_MODE, SKIP_COMMITS, CACHE_CONFIG, EXPECTED_QA_USERS, EXPECTED_DEV_USERS} from "./constants";
 import {aggregateCommits, fetchCommitsInDateRange} from "./commits";
 import {debugToFile} from "./debug";
 import {fetchRepositories} from "./repositories";
@@ -55,6 +55,78 @@ const PERIODS: Record<number, string> = {
 
 const MAX_RETRIES = 3;
 
+// Global statistics for error handling
+let errorStats = {
+    skippedPRs: 0,
+    cachedFallbackPRs: 0,
+    resetStats: () => {
+        errorStats.skippedPRs = 0;
+        errorStats.cachedFallbackPRs = 0;
+    }
+};
+
+// Function to determine appropriate TTL based on data age (PERPETUAL CACHE STRATEGY)
+function getSmartCacheTTL(dateRange: {since: string, until: string}, dataType: 'prs' | 'issues' | 'reviews' | 'events' = 'prs'): number {
+    const untilDate = new Date(dateRange.until);
+    const now = new Date();
+    const daysAgo = Math.floor((now.getTime() - untilDate.getTime()) / (1000 * 60 * 60 * 24));
+    
+    // Reviews and events NEVER expire - they're immutable once created
+    if (dataType === 'reviews' || dataType === 'events') {
+        console.log(`🔒 ${dataType} data - PERPETUAL cache (never expires)`);
+        return CACHE_CONFIG.REVIEWS_TTL_SECONDS; // 0 = never expire
+    }
+    
+    // Historical data (older than 7 days) - NEVER expires once cached
+    if (daysAgo > 7) {
+        console.log(`📚 Historical data (${daysAgo} days old) - PERPETUAL cache (never expires)`);
+        return CACHE_CONFIG.HISTORICAL_TTL_SECONDS; // 0 = never expire
+    }
+    
+    // Recent data (last 7 days) - short TTL for potential updates
+    if (daysAgo > 0) {
+        console.log(`📈 Recent data (${daysAgo} days old) - short cache (${CACHE_CONFIG.RECENT_TTL_HOURS}h)`);
+        return CACHE_CONFIG.RECENT_TTL_SECONDS;
+    }
+    
+    // Today's data - shortest TTL for real-time accuracy
+    console.log(`🔄 Today's data - short cache (${CACHE_CONFIG.TODAY_TTL_HOURS}h)`);
+    return CACHE_CONFIG.TODAY_TTL_SECONDS;
+}
+
+// Function to check API rate limit
+async function checkRateLimit(): Promise<{canMakeRequest: boolean, resetTime?: Date}> {
+    try {
+        const response = await octokit.rest.rateLimit.get();
+        const searchLimit = response.data.resources.search;
+        
+        console.log(`🔍 API Rate Limit Status - Search: ${searchLimit.remaining}/${searchLimit.limit} (resets at ${new Date(searchLimit.reset * 1000)})`);
+        
+        if (searchLimit.remaining <= 5) { // Keep some buffer
+            return {
+                canMakeRequest: false,
+                resetTime: new Date(searchLimit.reset * 1000)
+            };
+        }
+        
+        return { canMakeRequest: true };
+    } catch (error) {
+        console.warn("⚠️ Could not check rate limit, proceeding with caution:", error);
+        return { canMakeRequest: true };
+    }
+}
+
+// Function to wait for rate limit reset
+async function waitForRateLimit(resetTime: Date): Promise<void> {
+    const now = new Date();
+    const waitTime = resetTime.getTime() - now.getTime();
+    
+    if (waitTime > 0) {
+        console.log(`⏳ Waiting ${Math.ceil(waitTime / 1000 / 60)} minutes for rate limit reset...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+}
+
 
 // Function to fetch all pull requests within a given date range using date intervals
 async function fetchPullRequestsInDateRange(
@@ -64,39 +136,81 @@ async function fetchPullRequestsInDateRange(
 ) {
     const allPullRequests: RestIssueAndPullRequest[] = [];
     const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
+    
     for (const {since, until} of dateIntervals) {
-        const cacheKey = `${repoOwner}-${since}-${until}`;
-        const cachedResult = PRS_CACHE.get<RestIssueAndPullRequest[]>(cacheKey);
-        if (cachedResult) {
+        const cacheKey = `${repoOwner}-prs-${since}-${until}`;
+        
+        // Try to get from cache first (unless force refresh mode is enabled)
+        let cachedResult = FORCE_REFRESH_MODE ? null : await PRS_CACHE.getAsync<RestIssueAndPullRequest[]>(cacheKey);
+        if (cachedResult && cachedResult.length > 0 && !FORCE_REFRESH_MODE) {
+            console.log(`📦 Using cached PRs for ${since}..${until} (${cachedResult.length} items)`);
             allPullRequests.push(...cachedResult);
             continue;
         }
+        
+        if (FORCE_REFRESH_MODE) {
+            console.log(`🔄 Force refresh mode - fetching fresh data for ${since}..${until}`);
+        }
+        
+        // If in offline mode and no cache, skip this interval
+        if (USE_OFFLINE_MODE) {
+            console.log(`⚠️ Offline mode: skipping PRs for ${since}..${until} (no cache available)`);
+            continue;
+        }
+        
+        // Check rate limit before making API calls
+        const rateLimitStatus = await checkRateLimit();
+        if (!rateLimitStatus.canMakeRequest) {
+            if (rateLimitStatus.resetTime) {
+                await waitForRateLimit(rateLimitStatus.resetTime);
+            } else {
+                console.log(`⚠️ Rate limit exceeded, skipping PRs for ${since}..${until}`);
+                continue;
+            }
+        }
+        
         let page = 1;
         let hasMore = true;
+        const intervalPRs: RestIssueAndPullRequest[] = [];
+        
         while (hasMore) {
             try {
+                console.log(`🔍 Fetching PRs for ${since}..${until}, page ${page}`);
                 const response = await octokit.rest.search.issuesAndPullRequests({
                     q: `org:${repoOwner} type:pr is:merged created:${since}..${until}`,
                     per_page: 100,
                     page,
                 });
+                
                 // Handle rate limiting
                 await handleRateLimit(response);
-                allPullRequests.push(...response.data.items);
+                intervalPRs.push(...response.data.items);
 
                 // Check if there are more pages
                 hasMore = response.data.items.length === 100;
-                PRS_CACHE.set(cacheKey, response.data.items);
                 page += 1;
             } catch (error: any) {
                 if (error.status === 403) {
+                    console.log("⚠️ Rate limit hit during PR fetch, waiting...");
                     await handleRateLimit(error.response);
                 } else {
-                    throw error;
+                    console.error(`Error fetching PRs for ${since}..${until}:`, error);
+                    break;
                 }
             }
         }
+        
+        // Cache the results with smart TTL (perpetual for historical data)
+        if (intervalPRs.length > 0) {
+            const smartTTL = getSmartCacheTTL({since, until}, 'prs');
+            await PRS_CACHE.setAsync(cacheKey, intervalPRs, smartTTL);
+            const ttlDesc = smartTTL === 0 ? 'PERPETUAL' : `${smartTTL/3600}h`;
+            console.log(`💾 Cached ${intervalPRs.length} PRs for ${since}..${until} (TTL: ${ttlDesc})`);
+        }
+        
+        allPullRequests.push(...intervalPRs);
     }
+    
     return allPullRequests;
 }
 
@@ -111,6 +225,12 @@ async function fetchReviewsForPR(
     const cachedResult = PRS_REVIEW_CACHE.get<ReviewsForPullRequest>(cacheKey);
     if (cachedResult) {
         return {...cachedResult};
+    }
+    
+    // In offline mode, return empty data if not cached
+    if (USE_OFFLINE_MODE) {
+        console.log(`⚠️ Offline mode: skipping reviews for PR ${prNumber} (no cache available)`);
+        return {reviews: allReviews, reviewThreads: allReviewThreads};
     }
     let cursor: string | null = null;
     let hasMore = true;
@@ -181,14 +301,26 @@ async function fetchReviewsForPR(
                     body: JSON.stringify({query, variables})
                 });
 
-                // Handle rate limiting
-                await handleRateLimit(response);
+                if (!response.ok) {
+                    if (response.status === 403) {
+                        console.log(`⏳ GraphQL rate limit hit, waiting 60 seconds...`);
+                        await new Promise(resolve => setTimeout(resolve, 60000));
+                        throw new Error("Rate limit - retry");
+                    }
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
 
                 const result: any = await response.json();
 
                 if (result.errors) {
-                    console.error("GraphQL errors:fetchReviewsForPR:", result.errors);
-                    throw new Error("GraphQL query failed");
+                    console.error(`❌ GraphQL errors for PR ${prNumber}:`, result.errors);
+                    // Si es un error de rate limit, esperamos y reintentamos
+                    if (result.errors.some((err: any) => err.type === 'RATE_LIMITED')) {
+                        console.log(`⏳ GraphQL rate limit in response, waiting 60 seconds...`);
+                        await new Promise(resolve => setTimeout(resolve, 60000));
+                        throw new Error("Rate limit - retry");
+                    }
+                    throw new Error(`GraphQL query failed: ${result.errors[0]?.message || 'Unknown error'}`);
                 }
 
                 const reviews: GraphQLReviewNode = result.data.repository.pullRequest.reviews;
@@ -205,19 +337,39 @@ async function fetchReviewsForPR(
 
             } catch (error: any) {
                 retries--;
+                console.log(`⚠️ Error fetching reviews for PR ${prNumber} (${retries} retries left): ${error.message}`);
 
                 if (retries === 0) {
-                    throw new Error("Failed after multiple retries");
+                    console.error(`❌ Failed to fetch reviews for PR ${prNumber} after ${MAX_RETRIES} retries`);
+                    
+                    // Try to use cached data as fallback
+                    const cachedFallback = PRS_REVIEW_CACHE.get<ReviewsForPullRequest>(cacheKey);
+                    if (cachedFallback) {
+                        console.log(`🔄 Using cached data as fallback for PR ${prNumber}`);
+                        errorStats.cachedFallbackPRs++;
+                        return {...cachedFallback};
+                    }
+                    
+                    console.log(`⚠️ No cached data available, skipping PR ${prNumber} and continuing...`);
+                    errorStats.skippedPRs++;
+                    // Return empty result instead of throwing error
+                    return {
+                        reviews: [],
+                        reviewThreads: []
+                    };
                 }
 
                 const retryWaitTime = (MAX_RETRIES - retries) * 1000;
+                console.log(`⏳ Waiting ${retryWaitTime}ms before retry...`);
                 await new Promise(resolve => setTimeout(resolve, retryWaitTime));
             }
         }
     }
 
-    PRS_REVIEW_CACHE.set(cacheKey, {reviews: allReviews, reviewThreads: allReviewThreads});
-    return {reviews: allReviews, reviewThreads: allReviewThreads};
+    // Use longer TTL for reviews as they rarely change
+    const reviewData = {reviews: allReviews, reviewThreads: allReviewThreads};
+    await PRS_REVIEW_CACHE.setAsync(cacheKey, reviewData, CACHE_CONFIG.REVIEWS_TTL_SECONDS);
+    return reviewData;
 }
 
 // Function to categorize labels
@@ -244,10 +396,34 @@ async function fetchIssuesInDateRange(
     
     for (const {since, until} of dateIntervals) {
         const cacheKey = `${repoOwner}-issues-${since}-${until}`;
-        const cachedResult = ISSUES_CACHE.get<RestIssue[]>(cacheKey);
-        if (cachedResult) {
+        
+        // Try to get from cache first (unless force refresh mode is enabled)
+        let cachedResult = FORCE_REFRESH_MODE ? null : await ISSUES_CACHE.getAsync<RestIssue[]>(cacheKey);
+        if (cachedResult && cachedResult.length > 0 && !FORCE_REFRESH_MODE) {
+            console.log(`📦 Using cached issues for ${since}..${until} (${cachedResult.length} items)`);
             allIssues.push(...cachedResult);
             continue;
+        }
+        
+        if (FORCE_REFRESH_MODE) {
+            console.log(`🔄 Force refresh mode - fetching fresh issues for ${since}..${until}`);
+        }
+        
+        // If in offline mode and no cache, skip this interval
+        if (USE_OFFLINE_MODE) {
+            console.log(`⚠️ Offline mode: skipping issues for ${since}..${until} (no cache available)`);
+            continue;
+        }
+        
+        // Check rate limit before making API calls
+        const rateLimitStatus = await checkRateLimit();
+        if (!rateLimitStatus.canMakeRequest) {
+            if (rateLimitStatus.resetTime) {
+                await waitForRateLimit(rateLimitStatus.resetTime);
+            } else {
+                console.log(`⚠️ Rate limit exceeded, skipping issues for ${since}..${until}`);
+                continue;
+            }
         }
         
         let page = 1;
@@ -256,6 +432,7 @@ async function fetchIssuesInDateRange(
         
         while (hasMore) {
             try {
+                console.log(`🔍 Fetching issues for ${since}..${until}, page ${page}`);
                 const response = await octokit.rest.search.issuesAndPullRequests({
                     q: `org:${repoOwner} type:issue created:${since}..${until}`,
                     per_page: 100,
@@ -269,14 +446,23 @@ async function fetchIssuesInDateRange(
                 page += 1;
             } catch (error: any) {
                 if (error.status === 403) {
+                    console.log("⚠️ Rate limit hit during issues fetch, waiting...");
                     await handleRateLimit(error.response);
                 } else {
-                    throw error;
+                    console.error(`Error fetching issues for ${since}..${until}:`, error);
+                    break;
                 }
             }
         }
         
-        ISSUES_CACHE.set(cacheKey, intervalIssues);
+        // Cache the results with smart TTL (perpetual for historical data)
+        if (intervalIssues.length > 0) {
+            const smartTTL = getSmartCacheTTL({since, until}, 'issues');
+            await ISSUES_CACHE.setAsync(cacheKey, intervalIssues, smartTTL);
+            const ttlDesc = smartTTL === 0 ? 'PERPETUAL' : `${smartTTL/3600}h`;
+            console.log(`💾 Cached ${intervalIssues.length} issues for ${since}..${until} (TTL: ${ttlDesc})`);
+        }
+        
         allIssues.push(...intervalIssues);
     }
     
@@ -294,10 +480,34 @@ async function fetchClosedIssuesInDateRange(
     
     for (const {since, until} of dateIntervals) {
         const cacheKey = `${repoOwner}-closed-issues-${since}-${until}`;
-        const cachedResult = ISSUES_CACHE.get<ClosedIssue[]>(cacheKey);
-        if (cachedResult) {
+        
+        // Try to get from cache first (unless force refresh mode is enabled)
+        let cachedResult = FORCE_REFRESH_MODE ? null : await ISSUES_CACHE.getAsync<ClosedIssue[]>(cacheKey);
+        if (cachedResult && cachedResult.length > 0 && !FORCE_REFRESH_MODE) {
+            console.log(`📦 Using cached closed issues for ${since}..${until} (${cachedResult.length} items)`);
             allClosedIssues.push(...cachedResult);
             continue;
+        }
+        
+        if (FORCE_REFRESH_MODE) {
+            console.log(`🔄 Force refresh mode - fetching fresh closed issues for ${since}..${until}`);
+        }
+        
+        // If in offline mode and no cache, skip this interval
+        if (USE_OFFLINE_MODE) {
+            console.log(`⚠️ Offline mode: skipping closed issues for ${since}..${until} (no cache available)`);
+            continue;
+        }
+        
+        // Check rate limit before making API calls
+        const rateLimitStatus = await checkRateLimit();
+        if (!rateLimitStatus.canMakeRequest) {
+            if (rateLimitStatus.resetTime) {
+                await waitForRateLimit(rateLimitStatus.resetTime);
+            } else {
+                console.log(`⚠️ Rate limit exceeded, skipping closed issues for ${since}..${until}`);
+                continue;
+            }
         }
         
         let page = 1;
@@ -306,6 +516,7 @@ async function fetchClosedIssuesInDateRange(
         
         while (hasMore) {
             try {
+                console.log(`🔍 Fetching closed issues for ${since}..${until}, page ${page}`);
                 // Search for closed issues within the date range
                 const response = await octokit.rest.search.issuesAndPullRequests({
                     q: `org:${repoOwner} type:issue is:closed closed:${since}..${until}`,
@@ -329,15 +540,23 @@ async function fetchClosedIssuesInDateRange(
                 page += 1;
             } catch (error: any) {
                 if (error.status === 403) {
+                    console.log("⚠️ Rate limit hit during closed issues fetch, waiting...");
                     await handleRateLimit(error.response);
                 } else {
-                    console.error(`Error fetching closed issues:`, error);
+                    console.error(`Error fetching closed issues for ${since}..${until}:`, error);
                     break;
                 }
             }
         }
         
-        ISSUES_CACHE.set(cacheKey, intervalIssues);
+        // Cache the results with smart TTL (perpetual for historical data)
+        if (intervalIssues.length > 0) {
+            const smartTTL = getSmartCacheTTL({since, until}, 'issues');
+            await ISSUES_CACHE.setAsync(cacheKey, intervalIssues, smartTTL);
+            const ttlDesc = smartTTL === 0 ? 'PERPETUAL' : `${smartTTL/3600}h`;
+            console.log(`💾 Cached ${intervalIssues.length} closed issues for ${since}..${until} (TTL: ${ttlDesc})`);
+        }
+        
         allClosedIssues.push(...intervalIssues);
     }
     
@@ -368,7 +587,11 @@ async function fetchIssueComments(
             body: comment.body
         }));
     } catch (error: any) {
-        console.error(`Error fetching comments for issue ${issueNumber}:`, error);
+        if (error.status === 404) {
+            console.log(`⚠️ Issue #${issueNumber} not found or no access - skipping comments`);
+        } else {
+            console.error(`Error fetching comments for issue ${issueNumber}:`, error.message || error);
+        }
         return [];
     }
 }
@@ -399,7 +622,11 @@ async function findPRsMentioningIssue(
         
         return [...new Set(mentioningUsers)]; // Remove duplicates
     } catch (error: any) {
-        console.error(`Error searching PRs mentioning issue ${issueNumber}:`, error);
+        if (error.status === 403) {
+            console.log(`⚠️ Rate limit hit while searching PRs mentioning issue ${issueNumber} - skipping`);
+        } else {
+            console.error(`Error searching PRs mentioning issue ${issueNumber}:`, error.message || error);
+        }
         return [];
     }
 }
@@ -451,8 +678,13 @@ async function aggregateClosedIssueParticipation(
         // Count participation for each user
         participants.forEach(user => {
             const normalizedUser = user.toLowerCase();
-            // Skip excluded users
+            // Skip excluded users from general rankings
             if (EXCLUDED_FROM_RANKINGS.has(normalizedUser)) {
+                console.log(`🚫 Excluding user from closed issues: ${normalizedUser}`);
+                return;
+            }
+            // Skip excluded users from closed issues rankings
+            if (EXCLUDED_FROM_CLOSED_ISSUES.has(normalizedUser)) {
                 return;
             }
             
@@ -496,14 +728,19 @@ async function fetchLabelEventsForIssue(
         await handleRateLimit(response);
         
         const labelEvents = response.data.filter((event: any) => event.event === 'labeled') as IssueEvent[];
-        ISSUE_EVENTS_CACHE.set(cacheKey, labelEvents);
+        // Issue events rarely change, use longer TTL
+        await ISSUE_EVENTS_CACHE.setAsync(cacheKey, labelEvents, CACHE_CONFIG.REVIEWS_TTL_SECONDS);
         
         return labelEvents.filter(event => {
             const eventDate = new Date(event.created_at);
             return eventDate >= startDate && eventDate <= endDate;
         });
     } catch (error: any) {
-        console.error(`Error fetching label events for issue ${issueNumber}:`, error);
+        if (error.status === 404) {
+            console.log(`⚠️ Issue #${issueNumber} not found or no access (repo: ${repoName}) - skipping label events`);
+        } else {
+            console.error(`Error fetching label events for issue ${issueNumber}:`, error.message || error);
+        }
         return [];
     }
 }
@@ -584,7 +821,14 @@ const aggregateMetricsByDateRange = async (
     endDate: Date
 ): Promise<Record<string, AggregateMetrics>> => {
     const rawUserMetrics: Record<string, AggregateMetrics> = {};
-    const commits = await fetchCommitsInDateRange(repoOwner, repositories, startDate, endDate);
+    
+    // Skip commits in offline mode to avoid network issues
+    let commits: any[] = [];
+    if (!SKIP_COMMITS) {
+        commits = await fetchCommitsInDateRange(repoOwner, repositories, startDate, endDate);
+    } else {
+        console.log('⚠️ Skipping commits data (offline mode)');
+    }
     const pullRequests = await fetchPullRequestsInDateRange(
         repoOwner,
         startDate,
@@ -673,6 +917,7 @@ const aggregateMetricsByDateRange = async (
             return;
         }
         if (EXCLUDED_FROM_RANKINGS.has(normalizedAuthor)) { // Exclude users from rankings (system accounts, etc.)
+            console.log(`🚫 Excluding user from rankings: ${normalizedAuthor}`);
             return;
         }
         const aliasAuthor = AUTHOR_ALIAS_MAP.get(normalizedAuthor);
@@ -701,26 +946,66 @@ const aggregateMetricsByDateRange = async (
     return mergedUserMetrics;
 }
 
+// Function to ensure all expected users appear in metrics, even with 0 values
+function ensureAllExpectedUsers(
+    metrics: Record<string, AggregateMetrics>, 
+    closedIssuesParticipation: Record<string, number>
+): { 
+    metrics: Record<string, AggregateMetrics>, 
+    closedIssuesParticipation: Record<string, number> 
+} {
+    const defaultMetrics: AggregateMetrics = {
+        commits: 0,
+        pullRequests: 0,
+        reviews: 0,
+        rejections: 0,
+        score: 0,
+        bugLabels: 0,
+        enhancementLabels: 0,
+        otherLabels: 0,
+    };
+
+    // Ensure all expected QA users are present
+    EXPECTED_QA_USERS.forEach(user => {
+        if (!metrics[user]) {
+            metrics[user] = { ...defaultMetrics };
+        }
+        if (!(user in closedIssuesParticipation)) {
+            closedIssuesParticipation[user] = 0;
+        }
+    });
+
+    // Ensure all expected Dev users are present
+    EXPECTED_DEV_USERS.forEach(user => {
+        if (!metrics[user]) {
+            metrics[user] = { ...defaultMetrics };
+        }
+        if (!(user in closedIssuesParticipation)) {
+            closedIssuesParticipation[user] = 0;
+        }
+    });
+
+    return { metrics, closedIssuesParticipation };
+}
+
 // Function to send an email with the reports attached
 async function sendEmailWithAttachments(
-    attachment: Buffer, 
-    aggregateRanking: RankedUser[], 
+    _unused: any, 
     qaRanking: RankedUser[], 
     devRanking: RankedUser[], 
     closedIssuesQARanking: ClosedIssueRankedUser[],
     closedIssuesDevRanking: ClosedIssueRankedUser[],
     labelsReportPath?: string
 ) {
-    const rankedListString = aggregateRanking.map((rank, index) => {
-        return `${index + 1}.  ${rank.user} <br/>`;
-    }).join('\n');
     
     const qaRankedListString = qaRanking.map((rank, index) => {
-        return `${index + 1}.  ${rank.user} <br/>`;
+        const position = rank.finalRank || (index + 1);
+        return `${position}.  ${rank.user} <br/>`;
     }).join('\n');
     
     const devRankedListString = devRanking.map((rank, index) => {
-        return `${index + 1}.  ${rank.user} <br/>`;
+        const position = rank.finalRank || (index + 1);
+        return `${position}.  ${rank.user} <br/>`;
     }).join('\n');
     
     const closedIssuesQARankedListString = closedIssuesQARanking.map((rank, index) => {
@@ -734,7 +1019,7 @@ async function sendEmailWithAttachments(
     const attachments = [
         {
             filename: FILE_PATH,
-            path: FILE_PATH,
+            path: `./${FILE_PATH}`,
         }
     ];
     
@@ -742,12 +1027,13 @@ async function sendEmailWithAttachments(
     if (labelsReportPath) {
         attachments.push({
             filename: LABELS_FILE_PATH,
-            path: labelsReportPath,
+            path: `./${labelsReportPath}`,
         });
     }
     
     await sendTemplateEmail({
         users: [
+            {email: 'ezabala@insightt.io'},
             {email: 'alacret@insightt.io'},
             {email: 'ysouki@insightt.io'},
             {email: 'ezabala@insightt.io'},
@@ -755,9 +1041,6 @@ async function sendEmailWithAttachments(
         ],
         subject: "GitHub Metrics Report",
         body: `
-            <h2>📊 Overall Ranking (All Contributors)</h2>
-            ${rankedListString}
-            
             <h2>🔍 QA Team Ranking</h2>
             ${qaRankedListString}
             
@@ -941,26 +1224,45 @@ async function preloadCacheForDateRange(
     repositories: string[],
     startDate: Date,
     endDate: Date
-): Promise<void> {
+): Promise<{prsLoaded: number, issuesLoaded: number, closedIssuesLoaded: number}> {
     console.log("🚀 Preloading cache for better performance...");
     
     const dateIntervals = getDateIntervals(startDate, endDate, DAYS_IN_INTERVAL);
-    
-    // Preload commits cache
-    for (const {since, until} of dateIntervals) {
-        for (const repo of repositories) {
-            const cacheKey = `${repoOwner}-${repo}-${since}-${until}`;
-            await ISSUES_CACHE.preloadKey(cacheKey);
-        }
-    }
+    let prsLoaded = 0;
+    let issuesLoaded = 0;
+    let closedIssuesLoaded = 0;
     
     // Preload pull requests cache
     for (const {since, until} of dateIntervals) {
-        const cacheKey = `${repoOwner}-${since}-${until}`;
-        await PRS_CACHE.preloadKey(cacheKey);
+        const prsCacheKey = `${repoOwner}-prs-${since}-${until}`;
+        await PRS_CACHE.preloadKey(prsCacheKey);
+        const prsData = PRS_CACHE.get(prsCacheKey);
+        if (prsData) {
+            prsLoaded += Array.isArray(prsData) ? prsData.length : 0;
+        }
     }
     
-    console.log("✅ Cache preloading completed");
+    // Preload issues cache
+    for (const {since, until} of dateIntervals) {
+        const issuesCacheKey = `${repoOwner}-issues-${since}-${until}`;
+        await ISSUES_CACHE.preloadKey(issuesCacheKey);
+        const issuesData = ISSUES_CACHE.get(issuesCacheKey);
+        if (issuesData) {
+            issuesLoaded += Array.isArray(issuesData) ? issuesData.length : 0;
+        }
+        
+        // Preload closed issues cache
+        const closedIssuesCacheKey = `${repoOwner}-closed-issues-${since}-${until}`;
+        await ISSUES_CACHE.preloadKey(closedIssuesCacheKey);
+        const closedIssuesData = ISSUES_CACHE.get(closedIssuesCacheKey);
+        if (closedIssuesData) {
+            closedIssuesLoaded += Array.isArray(closedIssuesData) ? closedIssuesData.length : 0;
+        }
+    }
+    
+    console.log(`✅ Cache preloading completed - PRs: ${prsLoaded}, Issues: ${issuesLoaded}, Closed Issues: ${closedIssuesLoaded}`);
+    
+    return {prsLoaded, issuesLoaded, closedIssuesLoaded};
 }
 
 // Function to generate reports for multiple time PERIODS
@@ -968,6 +1270,9 @@ export async function generateReport(
     repoOwner: string,
 ) {
     try {
+        // Reset error statistics for this report generation
+        errorStats.resetStats();
+        
     const repositories = await fetchRepositories(repoOwner);
         
         // Cleanup expired cache entries
@@ -977,22 +1282,89 @@ export async function generateReport(
     const endDate = new Date();
     // We need to start from yesterday
     endDate.setDate(endDate.getDate() - 1);
-    let rankedUsers: RankedUser[] = [];
     let qaRanking: RankedUser[] = [];
     let devRanking: RankedUser[] = [];
     let closedIssuesQARanking: ClosedIssueRankedUser[] = [];
     let closedIssuesDevRanking: ClosedIssueRankedUser[] = [];
+    let debugInfo: any = {};
         
         // Preload cache for the longest period (12 weeks) to cover all cases
         const longestStartDate = new Date();
         longestStartDate.setDate(endDate.getDate() - 12 * 7);
-        await preloadCacheForDateRange(repoOwner, repositories, longestStartDate, endDate);
+        const cacheStats = await preloadCacheForDateRange(repoOwner, repositories, longestStartDate, endDate);
+        
+        // Show cache statistics
+        const totalCachedItems = cacheStats.prsLoaded + cacheStats.issuesLoaded + cacheStats.closedIssuesLoaded;
+        console.log(`📊 Cache Statistics: ${totalCachedItems} items loaded from cache`);
+        
+        if (USE_OFFLINE_MODE) {
+            console.log(`🔒 Running in OFFLINE MODE - only cached data will be used`);
+        } else if (totalCachedItems > 0) {
+            console.log(`⚡ Cache hit! This should significantly reduce API calls`);
+        } else {
+            console.log(`⚠️ No cached data found - will need to fetch from API`);
+        }
+
+    // Use only the longest period (12 weeks) for final rankings instead of incorrectly accumulating all periods
+    let finalMetrics: Record<string, AggregateMetrics> = {};
 
     for (const [weeksAgo, periodName] of Object.entries(PERIODS)) {
         const startDate = new Date();
         startDate.setDate(endDate.getDate() - Number(weeksAgo) * 7);
         const report = await aggregateMetricsByDateRange(repoOwner, repositories, startDate, endDate);
-        const commitsData = Object.entries(report)
+        
+        // Generate closed issues participation rankings for this specific period
+        console.log(`🔍 Generating closed issues participation for ${periodName}...`);
+        let closedIssuesParticipation = await aggregateClosedIssueParticipation(repoOwner, repositories, startDate, endDate);
+        
+        // Ensure all expected users appear in the data, even with 0 values
+        const ensuredData = ensureAllExpectedUsers({ ...report }, { ...closedIssuesParticipation });
+        const ensuredReport = ensuredData.metrics;
+        closedIssuesParticipation = ensuredData.closedIssuesParticipation;
+        
+        // Store the longest period (12 weeks) data for final rankings
+        if (Number(weeksAgo) === 12) {
+            finalMetrics = { ...ensuredReport };
+            console.log(`📊 Using 12-week period data for final rankings (${Object.keys(finalMetrics).length} users)`);
+        }
+        
+        // Create separate closed issues rankings for QA and Dev for this period
+        const closedIssuesData = Object.entries(closedIssuesParticipation)
+            .map(([author, participationCount]) => ({
+                author,
+                participation: participationCount
+            }))
+            .sort((a, b) => b.participation - a.participation);
+            
+        console.log(`📊 ${periodName} - Total closed issues participants: ${closedIssuesData.length}`);
+        
+        const closedIssuesQAData = closedIssuesData.filter(item => isQAUser(item.author));
+        const closedIssuesDevData = closedIssuesData.filter(item => !isQAUser(item.author) && !EXCLUDED_FROM_DEV_RANKING.has(item.author.toLowerCase()));
+        
+        console.log(`👥 ${periodName} - QA closed issues participants: ${closedIssuesQAData.length}`);
+        console.log(`💻 ${periodName} - Dev closed issues participants: ${closedIssuesDevData.length}`);
+        
+        // Create rankings with totalIndex based on participation ranking position for this period
+        const periodClosedIssuesQARanking = closedIssuesQAData.map((item, index) => ({
+            user: item.author,
+            totalIndex: index,
+            participation: item.participation
+        }));
+        
+        const periodClosedIssuesDevRanking = closedIssuesDevData.map((item, index) => ({
+            user: item.author,
+            totalIndex: index,
+            participation: item.participation
+        }));
+        
+        // Store the 12-week period data for final rankings (used in email)
+        if (Number(weeksAgo) === 12) {
+            closedIssuesQARanking = periodClosedIssuesQARanking;
+            closedIssuesDevRanking = periodClosedIssuesDevRanking;
+        }
+        
+        // Generate individual period data for Excel sheets
+        const commitsData = Object.entries(ensuredReport)
             .map((item: any) => {
                 return {
                     author: String(item[0]).toLowerCase(),
@@ -1000,7 +1372,7 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.commits - a.commits);
-        const mergedPrsData = Object.entries(report)
+        const mergedPrsData = Object.entries(ensuredReport)
             .map((item: any) => {
                 return {
                     author: String(item[0]).toLowerCase(),
@@ -1008,7 +1380,7 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.pullRequests - a.pullRequests);
-        const prsReviewsData = Object.entries(report)
+        const prsReviewsData = Object.entries(ensuredReport)
             .map((item: any) => {
                 return {
                     author: String(item[0]).toLowerCase(),
@@ -1016,22 +1388,33 @@ export async function generateReport(
                 };
             })
             .sort((a, b) => b.score - a.score);
-            const prsRejectionsData = Object.entries(report)
+            const prsRejectionsData = Object.entries(ensuredReport)
                 .map((item: any) => {
                     return {
                         author: String(item[0]).toLowerCase(),
                         rejections: item[1].rejections,
                     };
                 })
-                .sort((a, b) => b.rejections - a.rejections);
+                .sort((a, b) => a.rejections - b.rejections); // Ascendente: menos rechazos = mejor posición
 
         //Create a function to calculate the aggregate ranking
-        // Helper function to filter data by user type
+        // Helper function to filter data by user type (for individual period sheets)
         const filterDataByUserType = (data: any[], isQA: boolean) => {
-            return data.filter(item => isQAUser(item.author) === isQA);
+            return data.filter(item => {
+                const isUserQA = isQAUser(item.author);
+                // If we want QA users, return QA users
+                if (isQA) {
+                    return isUserQA;
+                }
+                // If we want Dev users, exclude QA users AND specifically excluded dev users
+                else {
+                    return !isUserQA && !EXCLUDED_FROM_DEV_RANKING.has(item.author.toLowerCase());
+                }
+            });
         };
+        
 
-        // Create separate datasets for QA and Dev users
+        // Create separate datasets for QA and Dev users (for individual period sheets)
         const qaCommitsData = filterDataByUserType(commitsData, true);
         const qaMultipliedPrsData = filterDataByUserType(mergedPrsData, true);
         const qaPrsReviewsData = filterDataByUserType(prsReviewsData, true);
@@ -1041,81 +1424,30 @@ export async function generateReport(
         const devMergedPrsData = filterDataByUserType(mergedPrsData, false);
         const devPrsReviewsData = filterDataByUserType(prsReviewsData, false);
         const devPrsRejectionsData = filterDataByUserType(prsRejectionsData, false);
-
-        // Generic ranking function
-        const createRanking = (commits: any[], prs: any[], reviews: any[], rejections: any[]): RankedUser[] => {
-            const rankingMap: { [key: string]: number } = {};
-
-            const sumIndexes = (array: any[]) => {
-                array.forEach((item, index) => {
-                    const user = item.author;
-                    if (!rankingMap[user]) rankingMap[user] = 0;
-                    rankingMap[user] += index;
-                });
-            };
-
-            sumIndexes(commits);
-            sumIndexes(prs);
-            sumIndexes(reviews);
-            sumIndexes(rejections);
-
-            return Object.entries(rankingMap)
-                .map(([user, totalIndex]) => ({user, totalIndex}))
-                .sort((a, b) => a.totalIndex - b.totalIndex);
-        };
-
-        // Create separate rankings
-        qaRanking = createRanking(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData);
-        devRanking = createRanking(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData);
         
-        // Generate closed issues participation rankings
-        console.log("🔍 Generating closed issues participation rankings...");
-        const closedIssuesParticipation = await aggregateClosedIssueParticipation(repoOwner, repositories, startDate, endDate);
         
-        // Create separate closed issues rankings for QA and Dev
-        const closedIssuesData = Object.entries(closedIssuesParticipation)
-            .map(([author, participationCount]) => ({
-                author,
-                participation: participationCount
-            }))
-            .sort((a, b) => b.participation - a.participation);
-            
-        const closedIssuesQAData = closedIssuesData.filter(item => isQAUser(item.author));
-        const closedIssuesDevData = closedIssuesData.filter(item => !isQAUser(item.author));
-        
-        // Create rankings with totalIndex based on participation ranking position
-        closedIssuesQARanking = closedIssuesQAData.map((item, index) => ({
-            user: item.author,
-            totalIndex: index,
-            participation: item.participation
-        }));
-        
-        closedIssuesDevRanking = closedIssuesDevData.map((item, index) => ({
-            user: item.author,
-            totalIndex: index,
-            participation: item.participation
-        }));
 
-        // Keep original aggregated ranking for backward compatibility
-        const aggregateRanking = (): RankedUser[] => {
-            return createRanking(commitsData, mergedPrsData, prsReviewsData, prsRejectionsData);
-        };
-
-        rankedUsers = aggregateRanking();
-
-        // Helper function to generate sheet data
-        const generateSheetData = (commits: any[], prs: any[], reviews: any[], rejections: any[]) => {
+        // Helper function to generate sheet data (keeping original structure, adding closed issues at the end)
+        const generateSheetData = (commits: any[], prs: any[], reviews: any[], rejections: any[], closedIssues?: ClosedIssueRankedUser[]) => {
         const sheetData: any[] = [];
-        sheetData.push([
+        
+        // Header row - original columns plus closed issues if provided
+        const headers = [
             "Commit's Users", "Changes: additions + deletions", 
             "Merged PRS", "No of Merged PRS", 
             "PRS Reviews", "No of PRS Reviews",
                 "Prs Rejected", "Nr of Prs Rejected"
-        ]);
+        ];
+        
+        if (closedIssues && closedIssues.length > 0) {
+            headers.push("Closed Issues Participation", "Nr of Closed Issues");
+        }
+        
+        sheetData.push(headers);
         
             const maxRows = Math.max(commits.length, prs.length, reviews.length, rejections.length);
         for(let i = 0; i < maxRows; i++) {
-            sheetData.push([
+            const row = [
                     i < commits.length ? `${i + 1}.  ${commits[i].author}` : "",
                     i < commits.length ? `${commits[i].commits}` : "",
                     i < prs.length ? `${i + 1}.  ${prs[i].author}` : "",
@@ -1124,49 +1456,41 @@ export async function generateReport(
                     i < reviews.length ? `${parseFloat(reviews[i].score.toFixed(1))}` : "",
                     i < rejections.length ? `${i + 1}.  ${rejections[i].author}` : "",
                     i < rejections.length ? `${rejections[i].rejections}` : "",
-                ]);
-            }
-            return sheetData;
-        };
-
-        // Helper function to generate closed issues sheet data
-        const generateClosedIssuesSheetData = (closedIssuesRanking: ClosedIssueRankedUser[]) => {
-            const sheetData: any[] = [];
-            sheetData.push([
-                "User", "Closed Issues Participation"
-            ]);
+            ];
             
-            for(let i = 0; i < closedIssuesRanking.length; i++) {
-                const user = closedIssuesRanking[i];
-                sheetData.push([
-                    `${i + 1}.  ${user.user}`,
-                    user.participation || 0
-                ]);
+            // Add closed issues columns only if data is provided
+            if (closedIssues && closedIssues.length > 0) {
+                row.push(
+                    i < closedIssues.length ? `${i + 1}.  ${closedIssues[i].user}` : "",
+                    i < closedIssues.length ? `${closedIssues[i].participation || 0}` : ""
+                );
             }
             
-            return sheetData;
-        };
-
-        // Generate sheet data for all users (original)
-        const sheetData = generateSheetData(commitsData, mergedPrsData, prsReviewsData, prsRejectionsData);
-
-        const worksheet = xlsx.utils.aoa_to_sheet(sheetData);
-        worksheet['!cols'] = [
-            {wch: 20}, // Commit's Users
-            {wch: 10}, // Changes: additions + deletions  
-            {wch: 20}, // Merged PRS
-            {wch: 12}, // No of Merged PRS
-            {wch: 20}, // PRS Reviews
-            {wch: 12}, // No of PRS Reviews
-                {wch: 20}, // Prs Rejected
-                {wch: 15}, // Nr of Prs Rejected
-        ];
-        xlsx.utils.book_append_sheet(workbook, worksheet, periodName);
+            sheetData.push(row);
+        }
         
-        // Generate QA team ranking sheet
-        const qaSheetData = generateSheetData(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData);
+        console.log(`🔍 DEBUG - Generated sheet data: ${sheetData.length} rows (including header)`);
+        if (sheetData.length > 1) {
+            console.log(`📋 Sample row:`, sheetData[1]);
+            }
+            
+            return sheetData;
+        };
+
+
+        
+        // Generate QA team ranking sheet (consolidated with closed issues)
+        console.log(`📊 Generating QA sheet with ${periodClosedIssuesQARanking.length} closed issues participants`);
+        console.log(`🔍 DEBUG - QA Data Arrays Length:`, {
+            commits: qaCommitsData.length,
+            prs: qaMultipliedPrsData.length,
+            reviews: qaPrsReviewsData.length,
+            rejections: qaPrsRejectionsData.length,
+            closedIssues: periodClosedIssuesQARanking.length
+        });
+        const qaSheetData = generateSheetData(qaCommitsData, qaMultipliedPrsData, qaPrsReviewsData, qaPrsRejectionsData, periodClosedIssuesQARanking);
         const qaWorksheet = xlsx.utils.aoa_to_sheet(qaSheetData);
-        qaWorksheet['!cols'] = [
+        const qaColumnWidths = [
             {wch: 20}, // Commit's Users
             {wch: 10}, // Changes: additions + deletions  
             {wch: 20}, // Merged PRS
@@ -1176,12 +1500,30 @@ export async function generateReport(
             {wch: 20}, // Prs Rejected
             {wch: 15}, // Nr of Prs Rejected
         ];
+        
+        // Add closed issues column widths if we have QA closed issues data
+        if (periodClosedIssuesQARanking && periodClosedIssuesQARanking.length > 0) {
+            qaColumnWidths.push(
+                {wch: 25}, // Closed Issues Participation
+                {wch: 15}  // Nr of Closed Issues
+            );
+        }
+        
+        qaWorksheet['!cols'] = qaColumnWidths;
         xlsx.utils.book_append_sheet(workbook, qaWorksheet, `${periodName} - QA Team`);
         
-        // Generate Dev team ranking sheet
-        const devSheetData = generateSheetData(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData);
+        // Generate Dev team ranking sheet (consolidated with closed issues)
+        console.log(`📊 Generating Dev sheet with ${periodClosedIssuesDevRanking.length} closed issues participants`);
+        console.log(`🔍 DEBUG - Dev Data Arrays Length:`, {
+            commits: devCommitsData.length,
+            prs: devMergedPrsData.length,
+            reviews: devPrsReviewsData.length,
+            rejections: devPrsRejectionsData.length,
+            closedIssues: periodClosedIssuesDevRanking.length
+        });
+        const devSheetData = generateSheetData(devCommitsData, devMergedPrsData, devPrsReviewsData, devPrsRejectionsData, periodClosedIssuesDevRanking);
         const devWorksheet = xlsx.utils.aoa_to_sheet(devSheetData);
-        devWorksheet['!cols'] = [
+        const devColumnWidths = [
             {wch: 20}, // Commit's Users
             {wch: 10}, // Changes: additions + deletions  
             {wch: 20}, // Merged PRS
@@ -1191,35 +1533,350 @@ export async function generateReport(
             {wch: 20}, // Prs Rejected
             {wch: 15}, // Nr of Prs Rejected
         ];
+        
+        // Add closed issues column widths if we have Dev closed issues data
+        if (periodClosedIssuesDevRanking && periodClosedIssuesDevRanking.length > 0) {
+            devColumnWidths.push(
+                {wch: 25}, // Closed Issues Participation
+                {wch: 15}  // Nr of Closed Issues
+            );
+        }
+        
+        devWorksheet['!cols'] = devColumnWidths;
         xlsx.utils.book_append_sheet(workbook, devWorksheet, `${periodName} - Dev Team`);
-        
-        // Generate Closed Issues QA ranking sheet
-        const closedIssuesQASheetData = generateClosedIssuesSheetData(closedIssuesQARanking);
-        const closedIssuesQAWorksheet = xlsx.utils.aoa_to_sheet(closedIssuesQASheetData);
-        closedIssuesQAWorksheet['!cols'] = [
-            {wch: 25}, // QA User
-            {wch: 20}, // Closed Issues Participation
-        ];
-        xlsx.utils.book_append_sheet(workbook, closedIssuesQAWorksheet, `${periodName} - QA Issues`);
-        
-        // Generate Closed Issues Dev ranking sheet
-        const closedIssuesDevSheetData = generateClosedIssuesSheetData(closedIssuesDevRanking);
-        const closedIssuesDevWorksheet = xlsx.utils.aoa_to_sheet(closedIssuesDevSheetData);
-        closedIssuesDevWorksheet['!cols'] = [
-            {wch: 25}, // Dev User
-            {wch: 20}, // Closed Issues Participation
-        ];
-        xlsx.utils.book_append_sheet(workbook, closedIssuesDevWorksheet, `${periodName} - Dev Issues`);
     }
+    
+    // After processing all periods, calculate final rankings using 12-week data
+    console.log("🏆 Calculating final rankings using 12-week period data...");
+    
+    // Create final data arrays for ranking calculations
+    const finalCommitsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            commits: metrics.commits,
+        }))
+        .sort((a, b) => b.commits - a.commits);
+        
+    const finalMergedPrsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            pullRequests: metrics.pullRequests,
+        }))
+        .sort((a, b) => b.pullRequests - a.pullRequests);
+        
+    const finalPrsReviewsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            score: metrics.score,
+        }))
+        .sort((a, b) => b.score - a.score);
+        
+    const finalPrsRejectionsData = Object.entries(finalMetrics)
+        .map(([author, metrics]) => ({
+            author: author,
+            rejections: metrics.rejections,
+        }))
+        .sort((a, b) => a.rejections - b.rejections);
+
+    // Helper function to filter final data by user type
+    const filterFinalDataByUserType = (data: any[], isQA: boolean) => {
+        return data.filter(item => {
+            const isUserQA = isQAUser(item.author);
+            // If we want QA users, return QA users
+            if (isQA) {
+                return isUserQA;
+            }
+            // If we want Dev users, exclude QA users AND specifically excluded dev users
+            else {
+                return !isUserQA && !EXCLUDED_FROM_DEV_RANKING.has(item.author.toLowerCase());
+            }
+        });
+    };
+
+    // Create separate final datasets for QA and Dev users
+    const qaFinalCommitsData = filterFinalDataByUserType(finalCommitsData, true);
+    const qaFinalPrsData = filterFinalDataByUserType(finalMergedPrsData, true);
+    const qaFinalReviewsData = filterFinalDataByUserType(finalPrsReviewsData, true);
+    const qaFinalRejectionsData = filterFinalDataByUserType(finalPrsRejectionsData, true);
+
+    const devFinalCommitsData = filterFinalDataByUserType(finalCommitsData, false);
+    const devFinalPrsData = filterFinalDataByUserType(finalMergedPrsData, false);
+    const devFinalReviewsData = filterFinalDataByUserType(finalPrsReviewsData, false);
+    const devFinalRejectionsData = filterFinalDataByUserType(finalPrsRejectionsData, false);
+
+    // Helper function to calculate positions with proper tie handling
+    const calculatePositionsWithTies = (array: any[], valueKey: string): Map<string, number> => {
+        const positions = new Map<string, number>();
+        
+        // Group users by their values
+        const valueGroups = new Map<any, string[]>();
+        array.forEach(item => {
+            const value = item[valueKey];
+            if (!valueGroups.has(value)) {
+                valueGroups.set(value, []);
+            }
+            valueGroups.get(value)!.push(item.author);
+        });
+        
+        // Sort values to assign positions correctly
+        const sortedValues = Array.from(valueGroups.keys()).sort((a, b) => {
+            // For rejections, lower is better (ascending)
+            if (valueKey === 'rejections') return a - b;
+            // For others, higher is better (descending)  
+            return b - a;
+        });
+        
+        let currentPosition = 1; // Start at position 1, not 0
+        sortedValues.forEach(value => {
+            const usersWithThisValue = valueGroups.get(value)!;
+            // All users with same value get the SAME position (this fixes the tie issue)
+            usersWithThisValue.forEach(user => {
+                positions.set(user, currentPosition);
+            });
+            // Next position is just the next consecutive number (not jumping)
+            // Example: 5 users at position 1, next user gets position 2 (consecutive)
+            currentPosition += 1;
+        });
+        
+        return positions;
+    };
+
+    // Generic ranking function with proper tie handling and tiebreakers
+    const createRanking = (commits: any[], prs: any[], reviews: any[], rejections: any[]): RankedUser[] => {
+        const rankingMap: { [key: string]: number } = {};
+
+        // Calculate positions for each metric with tie handling
+        const commitPositions = calculatePositionsWithTies(commits, 'commits');
+        const prPositions = calculatePositionsWithTies(prs, 'pullRequests');  
+        const reviewPositions = calculatePositionsWithTies(reviews, 'score');
+        const rejectionPositions = calculatePositionsWithTies(rejections, 'rejections');
+
+        // Create maps to get raw values for tiebreakers
+        const commitValues = new Map<string, number>();
+        const rejectionValues = new Map<string, number>();
+        
+        commits.forEach(c => commitValues.set(c.author, c.commits));
+        rejections.forEach(r => rejectionValues.set(r.author, r.rejections));
+
+        // Sum positions for each user
+        const allUsers = new Set([
+            ...commits.map(c => c.author),
+            ...prs.map(p => p.author),
+            ...reviews.map(r => r.author),
+            ...rejections.map(r => r.author)
+        ]);
+
+        allUsers.forEach(user => {
+            rankingMap[user] = 
+                (commitPositions.get(user) || commits.length + 1) +
+                (prPositions.get(user) || prs.length + 1) +
+                (reviewPositions.get(user) || reviews.length + 1) +
+                (rejectionPositions.get(user) || rejections.length + 1);
+        });
+
+        // Sort users by totalIndex with tiebreakers
+        const sortedUsers = Object.entries(rankingMap)
+            .map(([user, totalIndex]) => ({
+                user, 
+                totalIndex,
+                rejections: rejectionValues.get(user) || 0,
+                commits: commitValues.get(user) || 0
+            }))
+            .sort((a, b) => {
+                // Primary sort: by totalIndex (ascending - lower is better)
+                if (a.totalIndex !== b.totalIndex) {
+                    return a.totalIndex - b.totalIndex;
+                }
+                
+                // Tiebreaker 1: by rejections (ascending - fewer rejections is better)
+                if (a.rejections !== b.rejections) {
+                    return a.rejections - b.rejections;
+                }
+                
+                // Tiebreaker 2: by commits (descending - more commits is better)
+                return b.commits - a.commits;
+            });
+            
+        // Assign final positions handling ties with tiebreakers
+        const finalRanking: RankedUser[] = [];
+        let currentRank = 1;
+        
+        // Track ties for logging
+        const tieGroups = new Map<string, any[]>();
+        
+        for (let i = 0; i < sortedUsers.length; i++) {
+            const currentUser = sortedUsers[i];
+            const prevUser = i > 0 ? sortedUsers[i - 1] : null;
+            
+            // Check if this user should get a new rank (not tied with previous)
+            const isNewRank = !prevUser || 
+                currentUser.totalIndex !== prevUser.totalIndex ||
+                currentUser.rejections !== prevUser.rejections ||
+                currentUser.commits !== prevUser.commits;
+            
+            if (isNewRank && i > 0) {
+                currentRank = i + 1;
+            }
+            
+            // Create a key for grouping truly tied users (same totalIndex, rejections, and commits)
+            const tieKey = `${currentUser.totalIndex}-${currentUser.rejections}-${currentUser.commits}`;
+            if (!tieGroups.has(tieKey)) {
+                tieGroups.set(tieKey, []);
+            }
+            tieGroups.get(tieKey)!.push({
+                user: currentUser.user,
+                totalIndex: currentUser.totalIndex,
+                rejections: currentUser.rejections,
+                commits: currentUser.commits,
+                finalRank: currentRank
+            });
+            
+            finalRanking.push({
+                user: currentUser.user,
+                totalIndex: currentUser.totalIndex,
+                finalRank: currentRank
+            });
+        }
+        
+        // Log ties and tiebreaker information
+        console.log("\n🏆 FINAL RANKING WITH TIEBREAKERS:");
+        console.log("=".repeat(60));
+        
+        // Group by totalIndex for cleaner display
+        const scoreGroups = new Map<number, any[]>();
+        finalRanking.forEach(user => {
+            const userData = sortedUsers.find(u => u.user === user.user)!;
+            if (!scoreGroups.has(user.totalIndex)) {
+                scoreGroups.set(user.totalIndex, []);
+            }
+            scoreGroups.get(user.totalIndex)!.push({
+                ...user,
+                rejections: userData.rejections,
+                commits: userData.commits
+            });
+        });
+        
+        const sortedScores = Array.from(scoreGroups.keys()).sort((a, b) => a - b);
+        sortedScores.forEach(totalIndex => {
+            const usersWithThisScore = scoreGroups.get(totalIndex)!;
+            console.log(`\n📊 Score ${totalIndex} points:`);
+            
+            if (usersWithThisScore.length === 1) {
+                const user = usersWithThisScore[0];
+                console.log(`   ${user.finalRank}. ${user.user} (${user.rejections} rejections, ${user.commits} commits)`);
+            } else {
+                // Show tiebreaker details
+                console.log(`   ${usersWithThisScore.length} users with ${totalIndex} points:`);
+                usersWithThisScore
+                    .sort((a, b) => a.finalRank - b.finalRank)
+                    .forEach(user => {
+                        console.log(`   ${user.finalRank}. ${user.user} (${user.rejections} rejections, ${user.commits} commits)`);
+                    });
+            }
+        });
+        console.log("=".repeat(60));
+        
+        return finalRanking;
+    };
+
+    // Create final rankings using 12-week data
+    qaRanking = createRanking(qaFinalCommitsData, qaFinalPrsData, qaFinalReviewsData, qaFinalRejectionsData);
+    devRanking = createRanking(devFinalCommitsData, devFinalPrsData, devFinalReviewsData, devFinalRejectionsData);
+    
+    // Debug: Show alacret's individual positions in final data
+    const alacretCommitPos = devFinalCommitsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    const alacretPRPos = devFinalPrsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    const alacretReviewPos = devFinalReviewsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    const alacretRejectionPos = devFinalRejectionsData.findIndex(u => u.author.toLowerCase() === 'alacret') + 1;
+    
+    const alacretInDevRanking = devRanking.find(u => u.user.toLowerCase() === 'alacret');
+    const alacretFinalPos = devRanking.findIndex(u => u.user.toLowerCase() === 'alacret') + 1;
+    
+    // Store debug info to show at the end
+    debugInfo = {
+        commits: alacretCommitPos || 'Not found',
+        prs: alacretPRPos || 'Not found', 
+        reviews: alacretReviewPos || 'Not found',
+        rejections: alacretRejectionPos || 'Not found',
+        totalIndex: alacretInDevRanking?.totalIndex || 'Not found',
+        finalPosition: alacretFinalPos || 'Not found'
+    };
+
+    // Show ties verification for PR Rejections (most common ties)
+    console.log("\n🔍 TIES VERIFICATION - PR Rejections (12-Week Data):");
+    console.log("=".repeat(50));
+    const rejectionGroups = new Map<number, string[]>();
+    devFinalRejectionsData.forEach((user: any) => {
+        const rejections = user.rejections;
+        if (!rejectionGroups.has(rejections)) {
+            rejectionGroups.set(rejections, []);
+        }
+        rejectionGroups.get(rejections)!.push(user.author);
+    });
+    
+    const rejectionPositions = calculatePositionsWithTies(devFinalRejectionsData, 'rejections');
+    const sortedRejectionValues = Array.from(rejectionGroups.keys()).sort((a, b) => a - b);
+    
+    sortedRejectionValues.forEach(rejectionCount => {
+        const usersWithThisValue = rejectionGroups.get(rejectionCount)!;
+        const position = rejectionPositions.get(usersWithThisValue[0]);
+        console.log(`${rejectionCount} rejections: ${usersWithThisValue.length} users at position #${position}`);
+        if (usersWithThisValue.length <= 5) {
+            console.log(`  Users: ${usersWithThisValue.join(', ')}`);
+        }
+    });
+    console.log("=".repeat(50));
+    
+    
+    console.log(`✅ Final rankings calculated using 12-week period data only`);
+    console.log(`📊 Final metrics for ${Object.keys(finalMetrics).length} users`);
 
         // Generate the labels report
         console.log("🏷️  Starting labels report generation...");
         const labelsReportPath = await generateLabelsReport(repoOwner);
         console.log("✅ Labels report generation completed!");
+    
+    // Show error handling statistics
+    if (errorStats.skippedPRs > 0 || errorStats.cachedFallbackPRs > 0) {
+        console.log(`\n📊 Error Handling Summary:`);
+        if (errorStats.cachedFallbackPRs > 0) {
+            console.log(`🔄 PRs recovered from cache: ${errorStats.cachedFallbackPRs}`);
+        }
+        if (errorStats.skippedPRs > 0) {
+            console.log(`⚠️ PRs skipped (no data): ${errorStats.skippedPRs}`);
+        }
+        console.log(`✅ Report completed despite ${errorStats.skippedPRs + errorStats.cachedFallbackPRs} PR issues\n`);
+    }
+
+    // Show debug info at the end
+    console.log("\n" + "=".repeat(60));
+    console.log("🔍 DEBUG: alacret's positions in each Dev metric:");
+    console.log("=".repeat(60));
+    console.log(`- Commits: #${debugInfo.commits}`);
+    console.log(`- PRs Merged: #${debugInfo.prs}`);
+    console.log(`- PR Reviews: #${debugInfo.reviews}`);
+    console.log(`- PR Rejections: #${debugInfo.rejections}`);
+    console.log(`- Total Index Score: ${debugInfo.totalIndex}`);
+    console.log(`- Final Dev Ranking: #${debugInfo.finalPosition}`);
+    console.log("=".repeat(60));
         
         // Send the reports via email
-    const attachment = xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
-        await sendEmailWithAttachments(attachment, rankedUsers, qaRanking, devRanking, closedIssuesQARanking, closedIssuesDevRanking, labelsReportPath);
+    console.log("📧 Preparing to send email with both reports...");
+    // Save the Excel file to disk
+    xlsx.writeFile(workbook, FILE_PATH, {bookType: "xlsx"});
+    console.log(`📄 Excel file saved: ${FILE_PATH}`);
+    
+    // Verify files exist before sending email
+    const fs = await import('fs');
+    const mainFileExists = fs.existsSync(FILE_PATH);
+    const labelsFileExists = labelsReportPath ? fs.existsSync(labelsReportPath) : false;
+    console.log(`📋 File verification:`);
+    console.log(`   Main report (${FILE_PATH}): ${mainFileExists ? '✅ EXISTS' : '❌ MISSING'}`);
+    console.log(`   Labels report (${labelsReportPath}): ${labelsFileExists ? '✅ EXISTS' : '❌ MISSING'}`);
+    
+    // Send email with file paths (not buffer)
+    await sendEmailWithAttachments(undefined, qaRanking, devRanking, closedIssuesQARanking, closedIssuesDevRanking, labelsReportPath);
+    console.log("✅ Email sent successfully! Script should complete now.");
         
     } catch (error) {
         console.error("❌ Error generating report:", error);
@@ -1229,6 +1886,8 @@ export async function generateReport(
         await closeAllCaches();
     }
 }
+
+
 
 
 

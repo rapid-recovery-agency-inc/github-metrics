@@ -3,3 +3,6 @@ cron:
   - name: 'GitHub Metric Report: Every Friday Morning ET'
     url: '/github-metric-report'
     schedule: '0 0 * * FRI'
+  - name: 'GitHub Metric Report: First Day of Every Month'
+    url: '/github-metric-report'
+    schedule: '0 0 1 * *'

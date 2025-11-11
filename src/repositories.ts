@@ -4,7 +4,7 @@ import fetch from "node-fetch";
 import {GITHUB_GRAPHQL_API} from "./constants";
 
 const REPOSITORIES_QUERY = `
-    query($repoOwner: String!, , $cursor: String) {
+    query($repoOwner: String!, $cursor: String) {
         repositoryOwner(login: $repoOwner) {
             repositories(first: 100, after:$cursor) {
                 edges {

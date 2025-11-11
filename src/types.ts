@@ -188,6 +188,7 @@ export interface IssueParticipation {
 export interface RankedUser {
     user: string;
     totalIndex: number;
+    finalRank?: number;
 }
 
 export interface ClosedIssueRankedUser extends RankedUser {
